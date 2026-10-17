@@ -2430,17 +2430,19 @@ static gboolean scroll_enclosing(GtkWidget *area, GdkEventScroll *ev)
     GtkAdjustment *adj = horiz
         ? gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(sw))
         : gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(sw));
-    double step = gtk_adjustment_get_step_increment(adj);
-    if (step <= 0) step = 40;
+    /* One wheel notch scrolls ~1/8 of a page (min 60px) — the drawing area's
+       step increment is tiny, so basing it on the page size feels natural. */
+    double page = gtk_adjustment_get_page_size(adj);
+    double notch = MAX(page / 8.0, 60.0);
     double d = 0;
     if (ev->direction == GDK_SCROLL_UP || ev->direction == GDK_SCROLL_LEFT)
-        d = -step * 3;
+        d = -notch;
     else if (ev->direction == GDK_SCROLL_DOWN || ev->direction == GDK_SCROLL_RIGHT)
-        d = step * 3;
+        d = notch;
     else if (ev->direction == GDK_SCROLL_SMOOTH) {
         double dx, dy;
         gdk_event_get_scroll_deltas((GdkEvent *)ev, &dx, &dy);
-        d = (horiz ? dx : dy) * step * 3;
+        d = (horiz ? dx : dy) * notch;
     }
     double v = gtk_adjustment_get_value(adj) + d;
     double hi = gtk_adjustment_get_upper(adj) - gtk_adjustment_get_page_size(adj);
