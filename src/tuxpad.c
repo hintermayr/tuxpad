@@ -1862,7 +1862,9 @@ typedef struct {
     double    press_x, press_y, drag_dx, drag_dy;
     double    zoom;                 /* 1.0 = 100%                             */
     gboolean  compact;              /* show only signatures (cleaner view)    */
-    gboolean  panning;              /* dragging the empty canvas              */
+    gboolean  panning;              /* dragging to pan the view               */
+    gboolean  node_drag;            /* Shift+drag moving a single node         */
+    int       click_idx;            /* node under the press, for click-to-jump */
     double    pan_rx, pan_ry, pan_sx, pan_sy;
 } FlowGraph;
 
@@ -2604,14 +2606,18 @@ static gboolean on_flow_press(GtkWidget *area, GdkEventButton *ev, gpointer data
     if (ev->button != 1) return FALSE;
     double mx = ev->x / g->zoom, my = ev->y / g->zoom;
     int i = flow_hit(g, mx, my);
-    g->drag_idx = i;
     g->moved = FALSE;
     g->press_x = ev->x; g->press_y = ev->y;
-    if (i >= 0) {
-        g->panning = FALSE;
+    g->click_idx = i;                 /* for a pure click (jump to code) */
+
+    if ((ev->state & GDK_SHIFT_MASK) && i >= 0) {
+        /* Shift+drag moves a single node */
+        g->node_drag = TRUE; g->panning = FALSE; g->drag_idx = i;
         g->drag_dx = mx - g->x[i]; g->drag_dy = my - g->y[i];
+        set_area_cursor(area, "move");
     } else {
-        g->panning = TRUE;
+        /* plain drag pans the view (never touches the editor) */
+        g->node_drag = FALSE; g->panning = TRUE; g->drag_idx = -1;
         g->pan_rx = ev->x_root; g->pan_ry = ev->y_root;
         GtkWidget *sw = gtk_widget_get_ancestor(area, GTK_TYPE_SCROLLED_WINDOW);
         if (sw) {
@@ -2629,21 +2635,15 @@ static gboolean on_flow_motion(GtkWidget *area, GdkEventMotion *ev, gpointer dat
 {
     FlowGraph *g = data;
 
-    /* while not dragging: pointer over a node, open hand over empty canvas */
     if (!(ev->state & GDK_BUTTON1_MASK)) {
         int over = flow_hit(g, ev->x / g->zoom, ev->y / g->zoom);
         set_area_cursor(area, over >= 0 ? "pointer" : "grab");
         return FALSE;
     }
-    if (g->panning) {
-        pan_view(area, g->pan_sx, g->pan_sy, g->pan_rx, g->pan_ry,
-                 ev->x_root, ev->y_root);
-        return TRUE;
-    }
-    if (g->drag_idx < 0) return FALSE;
     if (fabs(ev->x - g->press_x) > 3 || fabs(ev->y - g->press_y) > 3)
         g->moved = TRUE;
-    if (g->moved) {
+
+    if (g->node_drag && g->drag_idx >= 0) {
         int i = g->drag_idx;
         g->x[i] = ev->x / g->zoom - g->drag_dx;
         g->y[i] = ev->y / g->zoom - g->drag_dy;
@@ -2656,6 +2656,9 @@ static gboolean on_flow_motion(GtkWidget *area, GdkEventMotion *ev, gpointer dat
         if (needw > curw || needh > curh)
             gtk_widget_set_size_request(area, MAX(needw, curw), MAX(needh, curh));
         gtk_widget_queue_draw(area);
+    } else if (g->panning) {
+        pan_view(area, g->pan_sx, g->pan_sy, g->pan_rx, g->pan_ry,
+                 ev->x_root, ev->y_root);
     }
     return TRUE;
 }
@@ -2664,15 +2667,16 @@ static gboolean on_flow_release(GtkWidget *area, GdkEventButton *ev, gpointer da
 {
     FlowGraph *g = data;
     if (ev->button != 1) return FALSE;
-    if (g->panning) { g->panning = FALSE; set_area_cursor(area, "grab"); }
-    else if (g->drag_idx >= 0 && !g->moved) {   /* a click: jump to the code */
-        int i = g->drag_idx;
+    set_area_cursor(area, "grab");
+    /* a pure click (no drag) on a node jumps to its code */
+    if (!g->moved && !g->node_drag && g->click_idx >= 0) {
+        int i = g->click_idx;
         if (g->file[i]) open_at_line(g->file[i], g->def_line[i]);
         else            goto_line_current(g->def_line[i]);
-        /* raise the editor window so the jump is visible */
         gtk_window_present(GTK_WINDOW(app.window));
     }
-    g->drag_idx = -1;
+    g->panning = FALSE; g->node_drag = FALSE;
+    g->drag_idx = -1; g->click_idx = -1;
     g->moved = FALSE;
     return TRUE;
 }
@@ -2749,7 +2753,7 @@ static void show_flow_window(FlowGraph *g, const char *subject)
     gtk_box_pack_start(GTK_BOX(bar), compact, FALSE, FALSE, 0);
 
     GtkWidget *hint = gtk_label_new(
-        "drag canvas to pan · drag a box to move it · click to jump · "
+        "drag to pan · click a box to jump · Shift+drag to move a box · "
         "Ctrl+scroll to zoom");
     gtk_box_pack_start(GTK_BOX(bar), hint, FALSE, FALSE, 8);
 
