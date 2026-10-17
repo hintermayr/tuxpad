@@ -37,7 +37,9 @@ GtkSourceView.
     **return values**; arrows show which function calls which.
     - **Automatic structured layout** — functions are placed in columns by
       call depth and ordered to reduce crossing arrows
-    - **Zoom in/out** with the toolbar buttons or Ctrl+scroll
+    - **Zoom in/out** with the toolbar buttons or Ctrl+scroll (zooms toward
+      the mouse pointer); a **Compact** toggle shows only signatures for a
+      clearer overview
     - **Drag** a box to rearrange it; **click** a box to open its function in
       the editor — the editor window is raised and the cursor jumps to the
       function's definition (hovering a box shows a hand cursor)

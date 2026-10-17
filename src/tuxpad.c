@@ -1861,6 +1861,7 @@ typedef struct {
     gboolean  moved;                /* became a drag rather than a click      */
     double    press_x, press_y, drag_dx, drag_dy;
     double    zoom;                 /* 1.0 = 100%                             */
+    gboolean  compact;              /* show only signatures (cleaner view)    */
 } FlowGraph;
 
 static gboolean is_c_keyword(const char *s)
@@ -2225,7 +2226,7 @@ static void flow_layout(FlowGraph *g, cairo_t *cr)
     double maxw = 120;
     for (int i = 0; i < n; i++) {
         double wmax = text_width(cr, g->header[i], 13);
-        int nl = count_lines(g->detail[i]);
+        int nl = g->compact ? 0 : count_lines(g->detail[i]);
         if (nl) {
             char **lines = g_strsplit(g->detail[i], "\n", -1);
             for (int j = 0; lines[j]; j++) {
@@ -2238,7 +2239,7 @@ static void flow_layout(FlowGraph *g, cairo_t *cr)
         g->h[i] = FLOW_HEADER_H + nl * FLOW_LINE_H + (nl ? 6 : 0);
         if (g->w[i] > maxw) maxw = g->w[i];
     }
-    double colw = maxw + 90;
+    double colw = maxw + (g->compact ? 55 : 70);
 
     /* order within layers */
     int *pos    = g_new0(int, n);
@@ -2376,7 +2377,7 @@ static gboolean on_flow_draw(GtkWidget *area, cairo_t *cr, gpointer data)
         cairo_show_text(cr, g->header[i]);
 
         /* detail lines */
-        if (g->detail[i] && *g->detail[i]) {
+        if (!g->compact && g->detail[i] && *g->detail[i]) {
             cairo_set_font_size(cr, 11);
             cairo_set_source_rgb(cr, 0.2, 0.2, 0.25);
             char **lines = g_strsplit(g->detail[i], "\n", -1);
@@ -2402,6 +2403,40 @@ static void flow_bounds(FlowGraph *g, double *W, double *H)
     *W = w; *H = h;
 }
 
+/* Set *zoom to newz and resize the canvas, keeping the content point under
+   (px,py) — full-canvas device coords, or <0 for the viewport centre — fixed
+   on screen (zoom about the cursor). cw,ch are the unscaled content size. */
+static void zoom_about(GtkWidget *area, double *zoom, double newz,
+                       double cw, double ch, double px, double py)
+{
+    double oldz = *zoom > 0 ? *zoom : 1.0;
+    GtkWidget *sw = gtk_widget_get_ancestor(area, GTK_TYPE_SCROLLED_WINDOW);
+    GtkAdjustment *ha=NULL, *va=NULL;
+    if (sw) {
+        ha=gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(sw));
+        va=gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(sw));
+    }
+    if (ha && px<0) px=gtk_adjustment_get_value(ha)+gtk_adjustment_get_page_size(ha)/2;
+    if (va && py<0) py=gtk_adjustment_get_value(va)+gtk_adjustment_get_page_size(va)/2;
+
+    *zoom = newz;
+    gtk_widget_set_size_request(area, (int)(cw*newz), (int)(ch*newz));
+
+    if (ha) {
+        double sx=gtk_adjustment_get_value(ha), ps=gtk_adjustment_get_page_size(ha);
+        double nsx=px*(newz/oldz) - (px - sx);
+        gtk_adjustment_set_upper(ha, cw*newz);
+        gtk_adjustment_set_value(ha, CLAMP(nsx, 0, MAX(cw*newz-ps, 0)));
+    }
+    if (va) {
+        double sy=gtk_adjustment_get_value(va), ps=gtk_adjustment_get_page_size(va);
+        double nsy=py*(newz/oldz) - (py - sy);
+        gtk_adjustment_set_upper(va, ch*newz);
+        gtk_adjustment_set_value(va, CLAMP(nsy, 0, MAX(ch*newz-ps, 0)));
+    }
+    gtk_widget_queue_draw(area);
+}
+
 static void flow_apply_zoom(FlowGraph *g)
 {
     if (!g->area) return;
@@ -2409,13 +2444,32 @@ static void flow_apply_zoom(FlowGraph *g)
     gtk_widget_set_size_request(g->area, (int)(W * g->zoom), (int)(H * g->zoom));
     gtk_widget_queue_draw(g->area);
 }
+static void flow_zoom(FlowGraph *g, double newz, double px, double py)
+{
+    if (!g->area) return;
+    double W, H; flow_bounds(g, &W, &H);
+    zoom_about(g->area, &g->zoom, newz, W, H, px, py);
+}
 
 static void on_zoom_in(GtkButton *b, gpointer d)
-{ (void)b; FlowGraph *g = d; g->zoom = MIN(g->zoom * 1.2, 4.0); flow_apply_zoom(g); }
+{ (void)b; FlowGraph *g = d; flow_zoom(g, MIN(g->zoom*1.2,4.0), -1, -1); }
 static void on_zoom_out(GtkButton *b, gpointer d)
-{ (void)b; FlowGraph *g = d; g->zoom = MAX(g->zoom / 1.2, 0.25); flow_apply_zoom(g); }
+{ (void)b; FlowGraph *g = d; flow_zoom(g, MAX(g->zoom/1.2,0.25), -1, -1); }
 static void on_zoom_reset(GtkButton *b, gpointer d)
-{ (void)b; FlowGraph *g = d; g->zoom = 1.0; flow_apply_zoom(g); }
+{ (void)b; FlowGraph *g = d; flow_zoom(g, 1.0, -1, -1); }
+
+static void on_flow_compact(GtkToggleButton *b, gpointer d)
+{
+    FlowGraph *g = d;
+    g->compact = gtk_toggle_button_get_active(b);
+    cairo_surface_t *m=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,1,1);
+    cairo_t *cr=cairo_create(m);
+    cairo_select_font_face(cr,"monospace",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr,13);
+    flow_layout(g, cr);
+    cairo_destroy(cr); cairo_surface_destroy(m);
+    flow_apply_zoom(g);
+}
 
 /* Scroll the enclosing GtkScrolledWindow explicitly. Returning FALSE from a
    child's scroll handler does not reliably reach the scrolled window, so we
@@ -2456,12 +2510,14 @@ static gboolean on_flow_scroll(GtkWidget *area, GdkEventScroll *ev, gpointer d)
 {
     FlowGraph *g = d;
     if (!(ev->state & GDK_CONTROL_MASK)) return scroll_enclosing(area, ev);
-    if (ev->direction == GDK_SCROLL_UP)
-        g->zoom = MIN(g->zoom * 1.1, 4.0);
-    else if (ev->direction == GDK_SCROLL_DOWN)
-        g->zoom = MAX(g->zoom / 1.1, 0.25);
-    else return TRUE;
-    flow_apply_zoom(g);
+    double nz;
+    if (ev->direction == GDK_SCROLL_UP) nz = MIN(g->zoom*1.1, 4.0);
+    else if (ev->direction == GDK_SCROLL_DOWN) nz = MAX(g->zoom/1.1, 0.25);
+    else if (ev->direction == GDK_SCROLL_SMOOTH) {
+        double dx,dy; gdk_event_get_scroll_deltas((GdkEvent*)ev,&dx,&dy);
+        nz = CLAMP(g->zoom * (1.0 - dy*0.1), 0.25, 4.0);
+    } else return TRUE;
+    flow_zoom(g, nz, ev->x, ev->y);
     return TRUE;
 }
 
@@ -2647,8 +2703,14 @@ static void show_flow_window(FlowGraph *g, const char *subject)
     gtk_box_pack_start(GTK_BOX(bar), zrst, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(bar), zin,  FALSE, FALSE, 0);
 
+    GtkWidget *compact = gtk_toggle_button_new_with_label("Compact");
+    gtk_widget_set_tooltip_text(compact,
+        "Show only function signatures for a clearer overview");
+    g_signal_connect(compact, "toggled", G_CALLBACK(on_flow_compact), g);
+    gtk_box_pack_start(GTK_BOX(bar), compact, FALSE, FALSE, 0);
+
     GtkWidget *hint = gtk_label_new(
-        "Drag to move · click to jump to code · Ctrl+scroll to zoom");
+        "drag · click to jump · Ctrl+scroll to zoom");
     gtk_box_pack_start(GTK_BOX(bar), hint, FALSE, FALSE, 8);
 
     GtkWidget *save = gtk_button_new_with_label("Save as PNG…");
@@ -3165,16 +3227,19 @@ static gboolean sf_release(GtkWidget *a, GdkEventButton *ev, gpointer d)
     }
     return TRUE;
 }
-static void sf_apply_zoom(StepFlow *sf)
-{ if(!sf->area)return; gtk_widget_set_size_request(sf->area,(int)(sf->width*sf->zoom),(int)(sf->height*sf->zoom)); gtk_widget_queue_draw(sf->area); }
-static void sf_zin (GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf->zoom=MIN(sf->zoom*1.2,4.0);sf_apply_zoom(sf);}
-static void sf_zout(GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf->zoom=MAX(sf->zoom/1.2,0.25);sf_apply_zoom(sf);}
-static void sf_zrst(GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf->zoom=1.0;sf_apply_zoom(sf);}
+static void sf_zoom(StepFlow *sf, double newz, double px, double py)
+{ if(sf->area) zoom_about(sf->area, &sf->zoom, newz, sf->width, sf->height, px, py); }
+static void sf_zin (GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf_zoom(sf,MIN(sf->zoom*1.2,4.0),-1,-1);}
+static void sf_zout(GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf_zoom(sf,MAX(sf->zoom/1.2,0.25),-1,-1);}
+static void sf_zrst(GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf_zoom(sf,1.0,-1,-1);}
 static gboolean sf_scroll(GtkWidget *a,GdkEventScroll *ev,gpointer d)
 { StepFlow*sf=d; if(!(ev->state&GDK_CONTROL_MASK))return scroll_enclosing(a,ev);
-  if(ev->direction==GDK_SCROLL_UP)sf->zoom=MIN(sf->zoom*1.1,4.0);
-  else if(ev->direction==GDK_SCROLL_DOWN)sf->zoom=MAX(sf->zoom/1.1,0.25);
-  else return TRUE; sf_apply_zoom(sf); return TRUE; }
+  double nz;
+  if(ev->direction==GDK_SCROLL_UP)nz=MIN(sf->zoom*1.1,4.0);
+  else if(ev->direction==GDK_SCROLL_DOWN)nz=MAX(sf->zoom/1.1,0.25);
+  else if(ev->direction==GDK_SCROLL_SMOOTH){ double dx,dy; gdk_event_get_scroll_deltas((GdkEvent*)ev,&dx,&dy); nz=CLAMP(sf->zoom*(1.0-dy*0.1),0.25,4.0); }
+  else return TRUE;
+  sf_zoom(sf,nz,ev->x,ev->y); return TRUE; }
 static void sf_save(GtkButton *b,gpointer d)
 {
     (void)b; StepFlow *sf=d;
