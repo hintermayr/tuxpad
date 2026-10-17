@@ -28,11 +28,17 @@ GtkSourceView.
     function box shows its **signature** (return type, name, parameters) in the
     header and, below, its **parameters**, detected **local variables**, and
     **return values**; arrows show which function calls which.
+    - **Automatic structured layout** — functions are placed in columns by
+      call depth and ordered to reduce crossing arrows
+    - **Zoom in/out** with the toolbar buttons or Ctrl+scroll
     - **Drag** a box to rearrange it; **click** a box to jump to that function
       in the editor
     - **Flow Diagram (Directory)** (Shift+F8) builds a combined call graph of
       every C/C++ file in a chosen directory (cross-file calls included)
-    - Save the diagram as PNG
+    - Save the diagram as PNG, or generate one headlessly:
+      `tuxpad --flow-png file.c out.png`
+
+![Flow diagram example](docs/flow-demo.png)
 - **View**: word wrap, zoom in/out/reset, line-number toggle, color themes
 - Notepad++-style **status bar**: length/lines, Ln/Col/Sel, EOL, encoding,
   language

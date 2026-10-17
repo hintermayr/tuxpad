@@ -1662,11 +1662,12 @@ typedef struct {
     double x[FLOW_MAX_NODES], y[FLOW_MAX_NODES];
     double w[FLOW_MAX_NODES], h[FLOW_MAX_NODES];
     double width, height;
-    /* interaction state (mouse drag / click) */
+    /* interaction state (mouse drag / click, zoom) */
     GtkWidget *area;
     int       drag_idx;             /* node under the pointer, or -1          */
     gboolean  moved;                /* became a drag rather than a click      */
     double    press_x, press_y, drag_dx, drag_dy;
+    double    zoom;                 /* 1.0 = 100%                             */
 } FlowGraph;
 
 static gboolean is_c_keyword(const char *s)
@@ -1780,6 +1781,7 @@ static void flow_build_init(FlowBuild *fb, FlowGraph *g)
 {
     memset(g, 0, sizeof *g);
     g->drag_idx = -1;
+    g->zoom = 1.0;
     memset(fb, 0, sizeof *fb);
     fb->g = g;
 }
@@ -1967,15 +1969,49 @@ static double text_width(cairo_t *cr, const char *s, double size)
     return te.width;
 }
 
+/* Order the nodes of layer L by the average order-position (barycenter) of
+   their neighbours in the adjacent layer `adj`, reducing edge crossings. */
+static void flow_order_layer(FlowGraph *g, int *lay, int *pos, int *lcount,
+                             int n, int L, int adj)
+{
+    int cnt = lcount[L];
+    double bary[FLOW_MAX_NODES];
+    for (int k = 0; k < cnt; k++) {
+        int v = lay[L * n + k];
+        double sum = 0; int deg = 0;
+        for (int e = 0; e < g->ne; e++) {
+            int u = -1;
+            if (g->e_from[e] == v && g->layer[g->e_to[e]]   == adj) u = g->e_to[e];
+            else if (g->e_to[e] == v && g->layer[g->e_from[e]] == adj) u = g->e_from[e];
+            if (u >= 0) { sum += pos[u]; deg++; }
+        }
+        bary[k] = deg ? sum / deg : pos[v];
+    }
+    /* stable insertion sort of the layer by barycenter */
+    for (int a = 1; a < cnt; a++) {
+        int va = lay[L * n + a]; double ba = bary[a]; int b = a - 1;
+        while (b >= 0 && bary[b] > ba) {
+            lay[L * n + b + 1] = lay[L * n + b]; bary[b + 1] = bary[b]; b--;
+        }
+        lay[L * n + b + 1] = va; bary[b + 1] = ba;
+    }
+    for (int k = 0; k < cnt; k++) pos[lay[L * n + k]] = k;
+}
+
+/* Structured layered layout: assign a column per call depth, order nodes to
+   reduce crossings, then align each node toward the centre of its neighbours
+   while keeping columns non-overlapping. */
 static void flow_layout(FlowGraph *g, cairo_t *cr)
 {
+    int n = g->n;
     int maxlayer = 0;
-    for (int i = 0; i < g->n; i++)
+    for (int i = 0; i < n; i++)
         if (g->layer[i] > maxlayer) maxlayer = g->layer[i];
+    int nlayers = maxlayer + 1;
 
     /* node sizes */
     double maxw = 120;
-    for (int i = 0; i < g->n; i++) {
+    for (int i = 0; i < n; i++) {
         double wmax = text_width(cr, g->header[i], 13);
         int nl = count_lines(g->detail[i]);
         if (nl) {
@@ -1990,23 +2026,78 @@ static void flow_layout(FlowGraph *g, cairo_t *cr)
         g->h[i] = FLOW_HEADER_H + nl * FLOW_LINE_H + (nl ? 6 : 0);
         if (g->w[i] > maxw) maxw = g->w[i];
     }
-
     double colw = maxw + 90;
-    double col_y[FLOW_MAX_NODES];
-    for (int L = 0; L <= maxlayer; L++) col_y[L] = FLOW_PADY;
 
-    for (int i = 0; i < g->n; i++) {
-        int L = g->layer[i];
-        g->x[i] = FLOW_PADX + L * colw;
-        g->y[i] = col_y[L];
-        col_y[L] += g->h[i] + FLOW_VGAP;
+    /* order within layers */
+    int *pos    = g_new0(int, n);
+    int *lcount = g_new0(int, nlayers);
+    int *lay    = g_new0(int, (gsize)nlayers * n);
+    for (int i = 0; i < n; i++) {
+        int L = g->layer[i]; int k = lcount[L]++;
+        pos[i] = k; lay[L * n + k] = i;
+    }
+    for (int sweep = 0; sweep < 6; sweep++) {
+        if (sweep % 2 == 0)
+            for (int L = 1; L < nlayers; L++)
+                flow_order_layer(g, lay, pos, lcount, n, L, L - 1);
+        else
+            for (int L = nlayers - 2; L >= 0; L--)
+                flow_order_layer(g, lay, pos, lcount, n, L, L + 1);
     }
 
-    double maxy = 0;
-    for (int L = 0; L <= maxlayer; L++)
-        if (col_y[L] > maxy) maxy = col_y[L];
-    g->width  = FLOW_PADX * 2 + (maxlayer + 1) * colw;
-    g->height = (maxy > 0 ? maxy : FLOW_PADY) + FLOW_PADY;
+    /* x by layer; initial y by stacking in order */
+    for (int L = 0; L < nlayers; L++) {
+        double yy = FLOW_PADY;
+        for (int k = 0; k < lcount[L]; k++) {
+            int v = lay[L * n + k];
+            g->x[v] = FLOW_PADX + L * colw;
+            g->y[v] = yy;
+            yy += g->h[v] + FLOW_VGAP;
+        }
+    }
+
+    /* alignment passes: pull each node toward its neighbours' centre while
+       preserving order and non-overlap within the column */
+    for (int iter = 0; iter < 10; iter++) {
+        for (int L = 0; L < nlayers; L++) {
+            int cnt = lcount[L];
+            double desired[FLOW_MAX_NODES];
+            for (int k = 0; k < cnt; k++) {
+                int v = lay[L * n + k];
+                double sum = 0; int deg = 0;
+                for (int e = 0; e < g->ne; e++) {
+                    int u = -1;
+                    if (g->e_from[e] == v) u = g->e_to[e];
+                    else if (g->e_to[e] == v) u = g->e_from[e];
+                    if (u >= 0) { sum += g->y[u] + g->h[u] / 2; deg++; }
+                }
+                desired[k] = deg ? sum / deg - g->h[v] / 2 : g->y[v];
+            }
+            double prev_bottom = FLOW_PADY;
+            for (int k = 0; k < cnt; k++) {
+                int v = lay[L * n + k];
+                double yv = desired[k] < prev_bottom ? prev_bottom : desired[k];
+                g->y[v] = yv;
+                prev_bottom = yv + g->h[v] + FLOW_VGAP;
+            }
+        }
+    }
+
+    g_free(pos); g_free(lcount); g_free(lay);
+
+    /* shift everything up so the topmost node sits at the top padding */
+    double miny = 1e9;
+    for (int i = 0; i < n; i++) if (g->y[i] < miny) miny = g->y[i];
+    double shift = FLOW_PADY - miny;
+    for (int i = 0; i < n; i++) g->y[i] += shift;
+
+    double W = 0, H = 0;
+    for (int i = 0; i < n; i++) {
+        if (g->x[i] + g->w[i] > W) W = g->x[i] + g->w[i];
+        if (g->y[i] + g->h[i] > H) H = g->y[i] + g->h[i];
+    }
+    g->width  = W + FLOW_PADX;
+    g->height = H + FLOW_PADY;
 }
 
 static gboolean on_flow_draw(GtkWidget *area, cairo_t *cr, gpointer data)
@@ -2016,6 +2107,9 @@ static gboolean on_flow_draw(GtkWidget *area, cairo_t *cr, gpointer data)
 
     cairo_set_source_rgb(cr, 1, 1, 1);
     cairo_paint(cr);
+
+    double z = g->zoom > 0 ? g->zoom : 1.0;
+    cairo_scale(cr, z, z);
     cairo_select_font_face(cr, "monospace",
         CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
 
@@ -2096,6 +2190,35 @@ static void flow_bounds(FlowGraph *g, double *W, double *H)
     *W = w; *H = h;
 }
 
+static void flow_apply_zoom(FlowGraph *g)
+{
+    if (!g->area) return;
+    double W, H; flow_bounds(g, &W, &H);
+    gtk_widget_set_size_request(g->area, (int)(W * g->zoom), (int)(H * g->zoom));
+    gtk_widget_queue_draw(g->area);
+}
+
+static void on_zoom_in(GtkButton *b, gpointer d)
+{ (void)b; FlowGraph *g = d; g->zoom = MIN(g->zoom * 1.2, 4.0); flow_apply_zoom(g); }
+static void on_zoom_out(GtkButton *b, gpointer d)
+{ (void)b; FlowGraph *g = d; g->zoom = MAX(g->zoom / 1.2, 0.25); flow_apply_zoom(g); }
+static void on_zoom_reset(GtkButton *b, gpointer d)
+{ (void)b; FlowGraph *g = d; g->zoom = 1.0; flow_apply_zoom(g); }
+
+static gboolean on_flow_scroll(GtkWidget *area, GdkEventScroll *ev, gpointer d)
+{
+    (void)area;
+    FlowGraph *g = d;
+    if (!(ev->state & GDK_CONTROL_MASK)) return FALSE;  /* let it scroll */
+    if (ev->direction == GDK_SCROLL_UP)
+        g->zoom = MIN(g->zoom * 1.1, 4.0);
+    else if (ev->direction == GDK_SCROLL_DOWN)
+        g->zoom = MAX(g->zoom / 1.1, 0.25);
+    else return FALSE;
+    flow_apply_zoom(g);
+    return TRUE;
+}
+
 static void on_flow_save(GtkButton *btn, gpointer data)
 {
     FlowGraph *g = data;
@@ -2108,6 +2231,7 @@ static void on_flow_save(GtkButton *btn, gpointer data)
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
         char *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
         double W, H; flow_bounds(g, &W, &H);
+        double z = g->zoom; g->zoom = 1.0;      /* export at 100% */
         cairo_surface_t *surf = cairo_image_surface_create(
             CAIRO_FORMAT_ARGB32, (int)W, (int)H);
         cairo_t *cr = cairo_create(surf);
@@ -2115,6 +2239,7 @@ static void on_flow_save(GtkButton *btn, gpointer data)
         cairo_surface_write_to_png(surf, path);
         cairo_destroy(cr);
         cairo_surface_destroy(surf);
+        g->zoom = z;
         g_free(path);
     }
     gtk_widget_destroy(dlg);
@@ -2148,11 +2273,12 @@ static gboolean on_flow_press(GtkWidget *area, GdkEventButton *ev, gpointer data
     (void)area;
     FlowGraph *g = data;
     if (ev->button != 1) return FALSE;
-    int i = flow_hit(g, ev->x, ev->y);
+    double mx = ev->x / g->zoom, my = ev->y / g->zoom;
+    int i = flow_hit(g, mx, my);
     g->drag_idx = i;
     g->moved = FALSE;
     g->press_x = ev->x; g->press_y = ev->y;
-    if (i >= 0) { g->drag_dx = ev->x - g->x[i]; g->drag_dy = ev->y - g->y[i]; }
+    if (i >= 0) { g->drag_dx = mx - g->x[i]; g->drag_dy = my - g->y[i]; }
     return TRUE;
 }
 
@@ -2164,12 +2290,12 @@ static gboolean on_flow_motion(GtkWidget *area, GdkEventMotion *ev, gpointer dat
         g->moved = TRUE;
     if (g->moved) {
         int i = g->drag_idx;
-        g->x[i] = ev->x - g->drag_dx;
-        g->y[i] = ev->y - g->drag_dy;
+        g->x[i] = ev->x / g->zoom - g->drag_dx;
+        g->y[i] = ev->y / g->zoom - g->drag_dy;
         if (g->x[i] < 0) g->x[i] = 0;
         if (g->y[i] < 0) g->y[i] = 0;
-        int needw = (int)(g->x[i] + g->w[i] + 40);
-        int needh = (int)(g->y[i] + g->h[i] + 40);
+        int needw = (int)((g->x[i] + g->w[i] + 40) * g->zoom);
+        int needh = (int)((g->y[i] + g->h[i] + 40) * g->zoom);
         int curw = 0, curh = 0;
         gtk_widget_get_size_request(area, &curw, &curh);
         if (needw > curw || needh > curh)
@@ -2235,12 +2361,30 @@ static void show_flow_window(FlowGraph *g, const char *subject)
 
     GtkWidget *bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_container_set_border_width(GTK_CONTAINER(bar), 6);
+
+    GtkWidget *zin   = gtk_button_new_from_icon_name("zoom-in",
+                                                     GTK_ICON_SIZE_BUTTON);
+    GtkWidget *zout  = gtk_button_new_from_icon_name("zoom-out",
+                                                     GTK_ICON_SIZE_BUTTON);
+    GtkWidget *zrst  = gtk_button_new_from_icon_name("zoom-original",
+                                                     GTK_ICON_SIZE_BUTTON);
+    gtk_widget_set_tooltip_text(zin,  "Zoom in (Ctrl+scroll)");
+    gtk_widget_set_tooltip_text(zout, "Zoom out (Ctrl+scroll)");
+    gtk_widget_set_tooltip_text(zrst, "Reset zoom");
+    g_signal_connect(zin,  "clicked", G_CALLBACK(on_zoom_in),    g);
+    g_signal_connect(zout, "clicked", G_CALLBACK(on_zoom_out),   g);
+    g_signal_connect(zrst, "clicked", G_CALLBACK(on_zoom_reset), g);
+    gtk_box_pack_start(GTK_BOX(bar), zout, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(bar), zrst, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(bar), zin,  FALSE, FALSE, 0);
+
+    GtkWidget *hint = gtk_label_new(
+        "Drag to move · click to jump to code · Ctrl+scroll to zoom");
+    gtk_box_pack_start(GTK_BOX(bar), hint, FALSE, FALSE, 8);
+
     GtkWidget *save = gtk_button_new_with_label("Save as PNG…");
     g_signal_connect(save, "clicked", G_CALLBACK(on_flow_save), g);
     gtk_box_pack_end(GTK_BOX(bar), save, FALSE, FALSE, 0);
-    GtkWidget *hint = gtk_label_new(
-        "Drag a box to move it · click it to jump to the code");
-    gtk_box_pack_start(GTK_BOX(bar), hint, FALSE, FALSE, 4);
     gtk_box_pack_start(GTK_BOX(vb), bar, FALSE, FALSE, 0);
 
     GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
@@ -2248,11 +2392,13 @@ static void show_flow_window(FlowGraph *g, const char *subject)
     g->area = area;
     gtk_widget_set_size_request(area, (int)g->width, (int)g->height);
     gtk_widget_add_events(area, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
-                                GDK_POINTER_MOTION_MASK | GDK_BUTTON1_MOTION_MASK);
+                                GDK_POINTER_MOTION_MASK | GDK_BUTTON1_MOTION_MASK |
+                                GDK_SCROLL_MASK);
     g_signal_connect(area, "draw",                 G_CALLBACK(on_flow_draw), g);
     g_signal_connect(area, "button-press-event",   G_CALLBACK(on_flow_press), g);
     g_signal_connect(area, "motion-notify-event",  G_CALLBACK(on_flow_motion), g);
     g_signal_connect(area, "button-release-event", G_CALLBACK(on_flow_release), g);
+    g_signal_connect(area, "scroll-event",         G_CALLBACK(on_flow_scroll), g);
     gtk_container_add(GTK_CONTAINER(sw), area);
     gtk_box_pack_start(GTK_BOX(vb), sw, TRUE, TRUE, 0);
 
@@ -2763,8 +2909,53 @@ static void ensure_font_schema(char **argv)
     g_free(exe);
 }
 
+/* Headless export: tuxpad --flow-png <source> <out.png>
+   Renders the flow diagram of a C/C++ file to a PNG without opening a window
+   (no display required). Returns 0 on success. */
+static int flow_png_export(const char *src, const char *out)
+{
+    char *content = NULL;
+    if (!g_file_get_contents(src, &content, NULL, NULL)) {
+        g_printerr("tuxpad: cannot read %s\n", src);
+        return 1;
+    }
+    FlowGraph *g = g_new0(FlowGraph, 1);
+    build_call_graph2(src, content, g);
+    g_free(content);
+    if (g->n == 0) {
+        g_printerr("tuxpad: no functions found in %s\n", src);
+        on_flow_destroy(NULL, g);
+        return 2;
+    }
+    cairo_surface_t *m = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+    cairo_t *mcr = cairo_create(m);
+    cairo_select_font_face(mcr, "monospace",
+        CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
+    flow_layout(g, mcr);
+    cairo_destroy(mcr);
+    cairo_surface_destroy(m);
+
+    double W, H; flow_bounds(g, &W, &H);
+    cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+                                                    (int)W, (int)H);
+    cairo_t *cr = cairo_create(s);
+    on_flow_draw(NULL, cr, g);
+    cairo_status_t st = cairo_surface_write_to_png(s, out);
+    cairo_destroy(cr);
+    cairo_surface_destroy(s);
+    int rc = (st == CAIRO_STATUS_SUCCESS) ? 0 : 3;
+    int nn = g->n, ne = g->ne;
+    on_flow_destroy(NULL, g);
+    if (rc == 0) g_print("Wrote %s (%dx%d, %d functions, %d calls)\n",
+                         out, (int)W, (int)H, nn, ne);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc >= 4 && !strcmp(argv[1], "--flow-png"))
+        return flow_png_export(argv[2], argv[3]);
+
     ensure_font_schema(argv);
     gtk_init(&argc, &argv);
 
