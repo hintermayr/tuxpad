@@ -1863,9 +1863,10 @@ typedef struct {
     double    zoom;                 /* 1.0 = 100%                             */
     gboolean  compact;              /* show only signatures (cleaner view)    */
     gboolean  panning;              /* dragging to pan the view               */
-    gboolean  node_drag;            /* Shift+drag moving a single node         */
+    gboolean  node_drag;            /* dragging a single node                  */
     int       click_idx;            /* node under the press, for click-to-jump */
     double    pan_rx, pan_ry, pan_sx, pan_sy;
+    char     *poskey;               /* key for saved node positions            */
 } FlowGraph;
 
 static gboolean is_c_keyword(const char *s)
@@ -2407,6 +2408,60 @@ static void flow_bounds(FlowGraph *g, double *W, double *H)
     *W = w; *H = h;
 }
 
+/* Where saved node positions for a diagram live. */
+static char *flow_pos_path(const char *key)
+{
+    if (!key || !*key) return NULL;
+    char *hash = g_compute_checksum_for_string(G_CHECKSUM_MD5, key, -1);
+    char *name = g_strconcat("flowpos-", hash, NULL);
+    char *p = config_path(name);
+    g_free(hash); g_free(name);
+    return p;
+}
+
+/* Apply previously saved positions (by function name) to the current graph. */
+static void flow_load_positions(FlowGraph *g)
+{
+    char *p = flow_pos_path(g->poskey);
+    if (!p) return;
+    char *data = NULL;
+    if (g_file_get_contents(p, &data, NULL, NULL)) {
+        char **lines = g_strsplit(data, "\n", -1);
+        for (int i = 0; lines[i]; i++) {
+            if (!*lines[i]) continue;
+            char **f = g_strsplit(lines[i], "\t", 3);
+            if (f[0] && f[1] && f[2]) {
+                int idx = flow_node_index(g, f[0]);
+                if (idx >= 0) { g->x[idx]=g_ascii_strtod(f[1],NULL);
+                                g->y[idx]=g_ascii_strtod(f[2],NULL); }
+            }
+            g_strfreev(f);
+        }
+        g_strfreev(lines);
+        g_free(data);
+        /* grow the recorded size to fit moved nodes */
+        double W, H; flow_bounds(g, &W, &H);
+        g->width = W; g->height = H;
+    }
+    g_free(p);
+}
+
+static void flow_save_positions(FlowGraph *g)
+{
+    char *p = flow_pos_path(g->poskey);
+    if (!p) return;
+    GString *s = g_string_new(NULL);
+    char bx[G_ASCII_DTOSTR_BUF_SIZE], by[G_ASCII_DTOSTR_BUF_SIZE];
+    for (int i = 0; i < g->n; i++) {
+        g_ascii_dtostr(bx, sizeof bx, g->x[i]);
+        g_ascii_dtostr(by, sizeof by, g->y[i]);
+        g_string_append_printf(s, "%s\t%s\t%s\n", g->name[i], bx, by);
+    }
+    g_file_set_contents(p, s->str, -1, NULL);
+    g_string_free(s, TRUE);
+    g_free(p);
+}
+
 /* Set *zoom to newz and resize the canvas, keeping the content point under
    (px,py) — full-canvas device coords, or <0 for the viewport centre — fixed
    on screen (zoom about the cursor). cw,ch are the unscaled content size. */
@@ -2587,6 +2642,7 @@ static void on_flow_destroy(GtkWidget *w, gpointer data)
         g_free(g->detail[i]);
         g_free(g->file[i]);
     }
+    g_free(g->poskey);
     g_free(g);
 }
 
@@ -2603,29 +2659,29 @@ static int flow_hit(FlowGraph *g, double x, double y)
 static gboolean on_flow_press(GtkWidget *area, GdkEventButton *ev, gpointer data)
 {
     FlowGraph *g = data;
-    if (ev->button != 1) return FALSE;
+    if (ev->button != 1 && ev->button != 2) return FALSE;
     double mx = ev->x / g->zoom, my = ev->y / g->zoom;
     int i = flow_hit(g, mx, my);
     g->moved = FALSE;
     g->press_x = ev->x; g->press_y = ev->y;
     g->pan_rx = ev->x_root; g->pan_ry = ev->y_root;  /* stable screen coords */
     g->click_idx = i;                 /* for a pure click (jump to code) */
+    GtkWidget *sw = gtk_widget_get_ancestor(area, GTK_TYPE_SCROLLED_WINDOW);
+    if (sw) {
+        g->pan_sx = gtk_adjustment_get_value(
+            gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(sw)));
+        g->pan_sy = gtk_adjustment_get_value(
+            gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(sw)));
+    }
 
-    if ((ev->state & GDK_SHIFT_MASK) && i >= 0) {
-        /* Shift+drag moves a single node */
+    if (ev->button == 1 && i >= 0) {
+        /* drag a node to reposition it (a plain click still jumps) */
         g->node_drag = TRUE; g->panning = FALSE; g->drag_idx = i;
         g->drag_dx = mx - g->x[i]; g->drag_dy = my - g->y[i];
         set_area_cursor(area, "move");
     } else {
-        /* plain drag pans the view (never touches the editor) */
+        /* drag empty space (or middle button anywhere) pans the view */
         g->node_drag = FALSE; g->panning = TRUE; g->drag_idx = -1;
-        GtkWidget *sw = gtk_widget_get_ancestor(area, GTK_TYPE_SCROLLED_WINDOW);
-        if (sw) {
-            g->pan_sx = gtk_adjustment_get_value(
-                gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(sw)));
-            g->pan_sy = gtk_adjustment_get_value(
-                gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(sw)));
-        }
         set_area_cursor(area, "grabbing");
     }
     return TRUE;
@@ -2635,9 +2691,9 @@ static gboolean on_flow_motion(GtkWidget *area, GdkEventMotion *ev, gpointer dat
 {
     FlowGraph *g = data;
 
-    if (!(ev->state & GDK_BUTTON1_MASK)) {
+    if (!(ev->state & (GDK_BUTTON1_MASK | GDK_BUTTON2_MASK))) {
         int over = flow_hit(g, ev->x / g->zoom, ev->y / g->zoom);
-        set_area_cursor(area, over >= 0 ? "pointer" : "grab");
+        set_area_cursor(area, over >= 0 ? "move" : "grab");
         return FALSE;
     }
     /* Use screen coords: panning scrolls the canvas, so widget-relative coords
@@ -2645,7 +2701,7 @@ static gboolean on_flow_motion(GtkWidget *area, GdkEventMotion *ev, gpointer dat
     if (fabs(ev->x_root - g->pan_rx) > 3 || fabs(ev->y_root - g->pan_ry) > 3)
         g->moved = TRUE;
 
-    if (g->node_drag && g->drag_idx >= 0) {
+    if (g->node_drag && g->drag_idx >= 0 && g->moved) {
         int i = g->drag_idx;
         g->x[i] = ev->x / g->zoom - g->drag_dx;
         g->y[i] = ev->y / g->zoom - g->drag_dy;
@@ -2668,15 +2724,17 @@ static gboolean on_flow_motion(GtkWidget *area, GdkEventMotion *ev, gpointer dat
 static gboolean on_flow_release(GtkWidget *area, GdkEventButton *ev, gpointer data)
 {
     FlowGraph *g = data;
-    if (ev->button != 1) return FALSE;
+    if (ev->button != 1 && ev->button != 2) return FALSE;
     set_area_cursor(area, "grab");
-    /* a pure click (no drag) on a node jumps to its code */
-    if (!g->moved && !g->node_drag && g->click_idx >= 0) {
+    /* a pure left-click (no drag) on a node jumps to its code */
+    if (ev->button == 1 && !g->moved && g->click_idx >= 0) {
         int i = g->click_idx;
         if (g->file[i]) open_at_line(g->file[i], g->def_line[i]);
         else            goto_line_current(g->def_line[i]);
         gtk_window_present(GTK_WINDOW(app.window));
     }
+    /* a node was repositioned: remember it for next time */
+    if (g->node_drag && g->moved) flow_save_positions(g);
     g->panning = FALSE; g->node_drag = FALSE;
     g->drag_idx = -1; g->click_idx = -1;
     g->moved = FALSE;
@@ -2708,6 +2766,8 @@ static void show_flow_window(FlowGraph *g, const char *subject)
     flow_layout(g, mcr);
     cairo_destroy(mcr);
     cairo_surface_destroy(tmp);
+
+    flow_load_positions(g);   /* restore any manually saved node positions */
 
     /* For a large graph, start zoomed out so the whole structure is visible. */
     double fitw = 1040.0 / g->width, fith = 740.0 / g->height;
@@ -2755,8 +2815,8 @@ static void show_flow_window(FlowGraph *g, const char *subject)
     gtk_box_pack_start(GTK_BOX(bar), compact, FALSE, FALSE, 0);
 
     GtkWidget *hint = gtk_label_new(
-        "drag to pan · click a box to jump · Shift+drag to move a box · "
-        "Ctrl+scroll to zoom");
+        "drag a box to move it · drag empty (or middle-drag) to pan · "
+        "click to jump · Ctrl+scroll to zoom");
     gtk_box_pack_start(GTK_BOX(bar), hint, FALSE, FALSE, 8);
 
     GtkWidget *save = gtk_button_new_with_label("Save as PNG…");
@@ -2797,6 +2857,7 @@ static void act_flow_diagram(GtkWidget *w, gpointer d)
     FlowGraph *g = g_new0(FlowGraph, 1);
     build_call_graph2(doc->path, text, g);
     g_free(text);
+    g->poskey = g_strdup(doc->path ? doc->path : "untitled");
     show_flow_window(g, doc->path ? document_basename(doc) : "untitled");
 }
 
@@ -2873,6 +2934,7 @@ static void act_flow_diagram_dir(GtkWidget *w, gpointer d)
 
     char *base = g_path_get_basename(dir);
     char *subject = g_strdup_printf("%s/  (%d files)", base, files);
+    g->poskey = g_strconcat("dir:", dir, NULL);
     show_flow_window(g, subject);
     g_free(subject); g_free(base); g_free(dir);
 }
