@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="page" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e9eef5"/>
+    </linearGradient>
+  </defs>
+  <!-- document body -->
+  <rect x="24" y="12" width="80" height="104" rx="8" ry="8"
+        fill="url(#page)" stroke="#355a7a" stroke-width="4"/>
+  <!-- folded corner accent bar -->
+  <rect x="24" y="12" width="80" height="16" rx="8" ry="8" fill="#3a7ca5"/>
+  <rect x="24" y="20" width="80" height="8" fill="#3a7ca5"/>
+  <!-- text lines -->
+  <g stroke-linecap="round" stroke-width="5">
+    <line x1="38" y1="46" x2="90" y2="46" stroke="#e24a4a"/>
+    <line x1="38" y1="60" x2="78" y2="60" stroke="#2f8f4e"/>
+    <line x1="38" y1="74" x2="86" y2="74" stroke="#2d6cb5"/>
+    <line x1="38" y1="88" x2="70" y2="88" stroke="#b58a2d"/>
+    <line x1="38" y1="102" x2="82" y2="102" stroke="#7a52b5"/>
+  </g>
+  <!-- pencil -->
+  <g transform="rotate(45 96 96)">
+    <rect x="88" y="70" width="16" height="48" rx="3" fill="#f4c542" stroke="#9a7a1a" stroke-width="2"/>
+    <polygon points="88,118 104,118 96,132" fill="#d9a441" stroke="#9a7a1a" stroke-width="2"/>
+    <polygon points="90,129 102,129 96,132" fill="#3a3a3a"/>
+  </g>
+</svg>

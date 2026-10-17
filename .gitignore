@@ -1,0 +1,10 @@
+# Build artifacts
+/tuxpad
+*.o
+*.so
+schemas/gschemas.compiled
+
+# Editor / OS cruft
+*.swp
+*~
+.vscode/

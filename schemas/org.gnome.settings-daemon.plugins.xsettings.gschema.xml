@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Local compatibility schema for tuxpad.
+
+  GNOME 50's gsettings-desktop-schemas moved the font keys
+  (antialiasing / hinting / rgba-order) out of
+  "org.gnome.settings-daemon.plugins.xsettings" into a separate
+  ".deprecated" schema, but GTK 3.24 still reads them from the original
+  schema and aborts when they are missing. This file restores those keys
+  so GTK3 apps can start. It is loaded only via GSETTINGS_SCHEMA_DIR by
+  tuxpad's launcher and does not modify any system file.
+-->
+<schemalist>
+  <enum id="org.gnome.settings-daemon.GsdFontAntialiasingMode">
+    <value nick="none" value="0"/>
+    <value nick="grayscale" value="1"/>
+    <value nick="rgba" value="2"/>
+  </enum>
+  <enum id="org.gnome.settings-daemon.GsdFontHinting">
+    <value nick="none" value="0"/>
+    <value nick="slight" value="1"/>
+    <value nick="medium" value="2"/>
+    <value nick="full" value="3"/>
+  </enum>
+  <enum id="org.gnome.settings-daemon.GsdFontRgbaOrder">
+    <value nick="rgba" value="0"/>
+    <value nick="rgb" value="1"/>
+    <value nick="bgr" value="2"/>
+    <value nick="vrgb" value="3"/>
+    <value nick="vbgr" value="4"/>
+  </enum>
+
+  <schema gettext-domain="gnome-settings-daemon"
+          id="org.gnome.settings-daemon.plugins.xsettings"
+          path="/org/gnome/settings-daemon/plugins/xsettings/">
+    <key name="antialiasing" enum="org.gnome.settings-daemon.GsdFontAntialiasingMode">
+      <default>'grayscale'</default>
+      <summary>Antialiasing</summary>
+      <description>The type of antialiasing to use when rendering fonts.</description>
+    </key>
+    <key name="hinting" enum="org.gnome.settings-daemon.GsdFontHinting">
+      <default>'slight'</default>
+      <summary>Hinting</summary>
+      <description>The type of hinting to use when rendering fonts.</description>
+    </key>
+    <key name="rgba-order" enum="org.gnome.settings-daemon.GsdFontRgbaOrder">
+      <default>'rgb'</default>
+      <summary>RGBA order</summary>
+      <description>The order of subpixel elements on an LCD screen.</description>
+    </key>
+    <key name="disabled-gtk-modules" type="as">
+      <default>[]</default>
+      <summary>List of explicitly disabled GTK+ modules</summary>
+      <description>A list of strings representing the GTK+ modules that will not be loaded.</description>
+    </key>
+    <key name="enabled-gtk-modules" type="as">
+      <default>[]</default>
+      <summary>List of explicitly enabled GTK+ modules</summary>
+      <description>A list of strings representing the GTK+ modules that will be loaded.</description>
+    </key>
+    <key type="a{sv}" name="overrides">
+      <default>{}</default>
+      <summary>A dictionary of XSETTINGS to override</summary>
+      <description>This dictionary maps XSETTINGS names to override values.</description>
+    </key>
+  </schema>
+</schemalist>
