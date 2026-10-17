@@ -39,6 +39,7 @@ typedef struct {
     char           *path;          /* full filesystem path or NULL        */
     gboolean        untitled;      /* never saved yet                     */
     GtkSourceSearchContext *search; /* lazily created search context      */
+    GtkSourceCompletionWords *words; /* word-completion provider          */
 } Document;
 
 /* ---- Global application state ---------------------------------------- */
@@ -63,6 +64,8 @@ typedef struct {
     int        untitled_count;
     gboolean   word_wrap;
     gboolean   show_line_numbers;
+    gboolean   hover_tooltips;     /* show symbol info on mouse-over        */
+    gboolean   autocomplete;       /* word auto-completion in the editor    */
 
     /* Find in Files results panel */
     GtkWidget     *results_panel;  /* bottom pane (hidden until first use) */
@@ -74,7 +77,13 @@ typedef struct {
     GtkWidget *plugins_menu;       /* submenu plugins add items to         */
     GList     *plugin_modules;     /* loaded GModule* list                 */
     TuxpadApi  api;                /* function table handed to plugins     */
+
+    /* Recent files */
+    GtkWidget *recent_menu;        /* "Open Recent" submenu                */
+    GPtrArray *recent;             /* char* paths, most recent first       */
 } App;
+
+#define RECENT_MAX 15
 
 static App app = {0};
 
@@ -86,6 +95,11 @@ static void      update_title(void);
 static gboolean  save_document(Document *doc, gboolean save_as);
 static void      apply_font_css(void);
 static void      set_tab_title(Document *doc);
+static void      open_path(const char *path);
+static void      add_recent(const char *path);
+static void      rebuild_recent_menu(void);
+static gboolean  on_query_tooltip(GtkWidget *view, int x, int y, gboolean kbd,
+                                  GtkTooltip *tip, gpointer u);
 
 /* ===================================================================== */
 /*  Font / zoom                                                           */
@@ -312,6 +326,21 @@ static Document *document_new(const char *path)
     g_signal_connect(doc->view, "notify::has-focus",
                      G_CALLBACK(on_cursor_moved), NULL);
 
+    gtk_widget_set_has_tooltip(doc->view, app.hover_tooltips);
+    g_signal_connect(doc->view, "query-tooltip",
+                     G_CALLBACK(on_query_tooltip), NULL);
+
+    /* word auto-completion from the document's own text */
+    doc->words = gtk_source_completion_words_new("Document", NULL);
+    gtk_source_completion_words_register(doc->words,
+                                         GTK_TEXT_BUFFER(doc->buffer));
+    if (app.autocomplete) {
+        GtkSourceCompletion *comp =
+            gtk_source_view_get_completion(GTK_SOURCE_VIEW(doc->view));
+        gtk_source_completion_add_provider(comp,
+            GTK_SOURCE_COMPLETION_PROVIDER(doc->words), NULL);
+    }
+
     gtk_widget_show_all(doc->scrolled);
     gtk_widget_show_all(tab);
     gtk_notebook_set_current_page(GTK_NOTEBOOK(app.notebook), page);
@@ -483,6 +512,7 @@ static void open_path(const char *path)
     set_tab_title(doc);
     update_title();
     update_status_bar();
+    add_recent(path);
 }
 
 static gboolean save_document(Document *doc, gboolean save_as)
@@ -534,6 +564,153 @@ static gboolean save_document(Document *doc, gboolean save_as)
     update_title();
     update_status_bar();
     return TRUE;
+}
+
+/* ===================================================================== */
+/*  Recent files & session                                                */
+/* ===================================================================== */
+
+/* Path to a file under ~/.config/tuxpad/, creating the directory. */
+static char *config_path(const char *name)
+{
+    char *dir = g_build_filename(g_get_user_config_dir(), "tuxpad", NULL);
+    g_mkdir_with_parents(dir, 0755);
+    char *p = g_build_filename(dir, name, NULL);
+    g_free(dir);
+    return p;
+}
+
+static void save_recent(void)
+{
+    if (!app.recent) return;
+    GString *s = g_string_new(NULL);
+    for (guint i = 0; i < app.recent->len; i++)
+        g_string_append_printf(s, "%s\n", (char *)g_ptr_array_index(app.recent, i));
+    char *p = config_path("recent");
+    g_file_set_contents(p, s->str, -1, NULL);
+    g_free(p);
+    g_string_free(s, TRUE);
+}
+
+static void load_recent(void)
+{
+    app.recent = g_ptr_array_new_with_free_func(g_free);
+    char *p = config_path("recent");
+    char *data = NULL;
+    if (g_file_get_contents(p, &data, NULL, NULL)) {
+        char **lines = g_strsplit(data, "\n", -1);
+        for (int i = 0; lines[i] && app.recent->len < RECENT_MAX; i++)
+            if (*lines[i]) g_ptr_array_add(app.recent, g_strdup(lines[i]));
+        g_strfreev(lines);
+        g_free(data);
+    }
+    g_free(p);
+}
+
+static void on_recent_clicked(GtkMenuItem *mi, gpointer data)
+{
+    (void)mi;
+    char *path = data;
+    if (g_file_test(path, G_FILE_TEST_EXISTS))
+        open_path(path);
+    else {
+        error_dialog("File no longer exists:\n%s", path);
+        /* drop it from the list */
+        for (guint i = 0; i < app.recent->len; i++)
+            if (!g_strcmp0(g_ptr_array_index(app.recent, i), path)) {
+                g_ptr_array_remove_index(app.recent, i); break;
+            }
+        save_recent();
+        rebuild_recent_menu();
+    }
+}
+
+static void on_recent_clear(GtkMenuItem *mi, gpointer data)
+{
+    (void)mi;(void)data;
+    g_ptr_array_set_size(app.recent, 0);
+    save_recent();
+    rebuild_recent_menu();
+}
+
+static void rebuild_recent_menu(void)
+{
+    if (!app.recent_menu) return;
+    gtk_container_foreach(GTK_CONTAINER(app.recent_menu),
+                          (GtkCallback)gtk_widget_destroy, NULL);
+    if (!app.recent || app.recent->len == 0) {
+        GtkWidget *mi = gtk_menu_item_new_with_label("(no recent files)");
+        gtk_widget_set_sensitive(mi, FALSE);
+        gtk_menu_shell_append(GTK_MENU_SHELL(app.recent_menu), mi);
+    } else {
+        for (guint i = 0; i < app.recent->len; i++) {
+            char *path = g_ptr_array_index(app.recent, i);
+            char *base = g_path_get_basename(path);
+            char *label = g_strdup_printf("%u  %s", i + 1, base);
+            GtkWidget *mi = gtk_menu_item_new_with_label(label);
+            gtk_widget_set_tooltip_text(mi, path);
+            g_signal_connect(mi, "activate",
+                             G_CALLBACK(on_recent_clicked), path);
+            gtk_menu_shell_append(GTK_MENU_SHELL(app.recent_menu), mi);
+            g_free(base); g_free(label);
+        }
+        gtk_menu_shell_append(GTK_MENU_SHELL(app.recent_menu),
+                              gtk_separator_menu_item_new());
+        GtkWidget *clr = gtk_menu_item_new_with_label("Clear Recent List");
+        g_signal_connect(clr, "activate", G_CALLBACK(on_recent_clear), NULL);
+        gtk_menu_shell_append(GTK_MENU_SHELL(app.recent_menu), clr);
+    }
+    gtk_widget_show_all(app.recent_menu);
+}
+
+static void add_recent(const char *path)
+{
+    if (!path || !app.recent) return;
+    char *abs = g_canonicalize_filename(path, NULL);
+    /* remove existing occurrence */
+    for (guint i = 0; i < app.recent->len; i++)
+        if (!g_strcmp0(g_ptr_array_index(app.recent, i), abs)) {
+            g_ptr_array_remove_index(app.recent, i); break;
+        }
+    g_ptr_array_insert(app.recent, 0, abs);        /* most recent first */
+    while (app.recent->len > RECENT_MAX)
+        g_ptr_array_remove_index(app.recent, app.recent->len - 1);
+    save_recent();
+    rebuild_recent_menu();
+}
+
+/* Persist the list of open file paths, and restore them on next launch. */
+static void save_session(void)
+{
+    GString *s = g_string_new(NULL);
+    gint n = gtk_notebook_get_n_pages(GTK_NOTEBOOK(app.notebook));
+    for (gint i = 0; i < n; i++) {
+        GtkWidget *ch = gtk_notebook_get_nth_page(GTK_NOTEBOOK(app.notebook), i);
+        Document *dc = g_object_get_data(G_OBJECT(ch), "document");
+        if (dc && dc->path) g_string_append_printf(s, "%s\n", dc->path);
+    }
+    char *p = config_path("session");
+    g_file_set_contents(p, s->str, -1, NULL);
+    g_free(p);
+    g_string_free(s, TRUE);
+}
+
+static int restore_session(void)
+{
+    char *p = config_path("session");
+    char *data = NULL;
+    int opened = 0;
+    if (g_file_get_contents(p, &data, NULL, NULL)) {
+        char **lines = g_strsplit(data, "\n", -1);
+        for (int i = 0; lines[i]; i++)
+            if (*lines[i] && g_file_test(lines[i], G_FILE_TEST_EXISTS)) {
+                open_path(lines[i]); opened++;
+            }
+        g_strfreev(lines);
+        g_free(data);
+    }
+    g_free(p);
+    return opened;
 }
 
 /* ===================================================================== */
@@ -612,7 +789,7 @@ static gboolean confirm_quit(void)
 }
 
 static void act_quit(GtkWidget *w, gpointer d)
-{ (void)w;(void)d; if (confirm_quit()) gtk_main_quit(); }
+{ (void)w;(void)d; if (confirm_quit()) { save_session(); gtk_main_quit(); } }
 
 static void act_print(GtkWidget *w, gpointer d)
 {
@@ -1804,12 +1981,31 @@ static void flow_add_file(FlowBuild *fb, const char *file, const char *text)
         if (!is_c_keyword(name)) {
             gssize brace = end - 1;
             gssize bend = match_brace(text, len, brace);
-            if (bend > brace && flow_node_index(g, name) < 0) {
+
+            /* The text from the start of the line up to the name is the return
+               type. A real return type never contains ')', ',', ';', '=' or a
+               lone ':'. Rejecting those filters out C++ constructor member
+               initializer lists ("Foo::Foo(x) : a_(x), b_(y) {"), ternary
+               expressions, labels and bitfields that would otherwise look like
+               a definition. */
+            gssize ls = start;
+            while (ls > 0 && text[ls-1] != '\n') ls--;
+            gboolean rt_ok = TRUE;
+            for (gssize p = ls; p < start && rt_ok; p++) {
+                char c = text[p];
+                if (c==')'||c=='('||c==','||c==';'||c=='='||c=='{'||c=='}')
+                    rt_ok = FALSE;
+                else if (c==':') {
+                    gboolean scope = (p+1 < start && text[p+1]==':') ||
+                                     (p > ls && text[p-1]==':');
+                    if (!scope) rt_ok = FALSE;
+                }
+            }
+
+            if (rt_ok && bend > brace && flow_node_index(g, name) < 0) {
                 int idx = g->n;
                 g->name[idx] = g_strdup(name);
 
-                gssize ls = start;
-                while (ls > 0 && text[ls-1] != '\n') ls--;
                 char *rtraw = g_strndup(text + ls, start - ls);
                 char *rt = collapse_ws(rtraw);
                 g_free(rtraw);
@@ -2363,6 +2559,13 @@ static void show_flow_window(FlowGraph *g, const char *subject)
     cairo_destroy(mcr);
     cairo_surface_destroy(tmp);
 
+    /* For a large graph, start zoomed out so the whole structure is visible. */
+    double fitw = 1040.0 / g->width, fith = 740.0 / g->height;
+    double fit = MIN(fitw, fith);
+    if (fit > 1.0) fit = 1.0;
+    if (fit < 0.2) fit = 0.2;
+    g->zoom = fit;
+
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     char *title = g_strdup_printf("Flow Diagram — %s  (%d functions, %d calls)",
         subject ? subject : "untitled", g->n, g->ne);
@@ -2370,8 +2573,8 @@ static void show_flow_window(FlowGraph *g, const char *subject)
     g_free(title);
     gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(app.window));
     gtk_window_set_default_size(GTK_WINDOW(win),
-        (int)CLAMP(g->width + 40, 400, 1100),
-        (int)CLAMP(g->height + 90, 300, 800));
+        (int)CLAMP(g->width * g->zoom + 40, 400, 1100),
+        (int)CLAMP(g->height * g->zoom + 90, 300, 800));
 
     GtkWidget *vb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(win), vb);
@@ -2407,7 +2610,8 @@ static void show_flow_window(FlowGraph *g, const char *subject)
     GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
     GtkWidget *area = gtk_drawing_area_new();
     g->area = area;
-    gtk_widget_set_size_request(area, (int)g->width, (int)g->height);
+    gtk_widget_set_size_request(area, (int)(g->width * g->zoom),
+                                      (int)(g->height * g->zoom));
     gtk_widget_add_events(area, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
                                 GDK_POINTER_MOTION_MASK | GDK_BUTTON1_MOTION_MASK |
                                 GDK_SCROLL_MASK);
@@ -2517,6 +2721,494 @@ static void act_flow_diagram_dir(GtkWidget *w, gpointer d)
 }
 
 /* ===================================================================== */
+/*  Detailed flow diagram: control flow + variable processing            */
+/* ===================================================================== */
+
+#define SF_MAX 600
+enum { SF_START, SF_END, SF_PROCESS, SF_ASSIGN, SF_DECISION, SF_LOOP,
+       SF_RETURN, SF_LABEL };
+
+typedef struct {
+    char   *text[SF_MAX];
+    int     type[SF_MAX];
+    int     depth[SF_MAX];
+    int     line[SF_MAX];
+    int     n;
+    double  x[SF_MAX], y[SF_MAX], w[SF_MAX], h[SF_MAX];
+    double  width, height;
+    char   *file;
+    GtkWidget *area;
+    double  zoom;
+    double  press_x, press_y;
+} StepFlow;
+
+static void sf_push(StepFlow *sf, int type, int depth, int line, const char *text)
+{
+    if (sf->n >= SF_MAX) return;
+    char *t = collapse_ws(text);
+    if (g_utf8_strlen(t, -1) > 72) {
+        char buf[400];
+        g_utf8_strncpy(buf, t, 72);
+        g_free(t);
+        t = g_strconcat(buf, "…", NULL);
+    }
+    sf->text[sf->n] = t;
+    sf->type[sf->n] = type;
+    sf->depth[sf->n] = depth;
+    sf->line[sf->n] = line;
+    sf->n++;
+}
+
+static gboolean has_assign(const char *s)
+{
+    for (const char *p = s; *p; p++)
+        if (*p == '=') {
+            char prev = (p > s) ? p[-1] : 0, next = p[1];
+            if (next == '=') { continue; }
+            if (prev=='='||prev=='!'||prev=='<'||prev=='>'||prev=='~') continue;
+            return TRUE;
+        }
+    return FALSE;
+}
+
+static int classify_stmt(const char *s)
+{
+    while (*s==' '||*s=='\t') s++;
+    char fw[32]; int i = 0; const char *p = s;
+    while ((g_ascii_isalnum(*p)||*p=='_') && i < 31) fw[i++] = *p++;
+    fw[i] = 0;
+    if (!strcmp(fw,"if")||!strcmp(fw,"switch")) return SF_DECISION;
+    if (!strcmp(fw,"else")) {
+        const char *q = p; while (*q==' '||*q=='\t') q++;
+        return !strncmp(q,"if",2) ? SF_DECISION : SF_LABEL;
+    }
+    if (!strcmp(fw,"for")||!strcmp(fw,"while")||!strcmp(fw,"do")) return SF_LOOP;
+    if (!strcmp(fw,"case")||!strcmp(fw,"default")) return SF_LABEL;
+    if (!strcmp(fw,"return")) return SF_RETURN;
+    if (has_assign(s)) return SF_ASSIGN;
+    return SF_PROCESS;
+}
+
+/* Split a function body into a linear list of flowchart steps. */
+static void parse_steps(StepFlow *sf, const char *body, int base_line)
+{
+    int len = strlen(body), depth = 0, paren = 0, line = base_line;
+    GString *buf = g_string_new(NULL);
+    int stmt_line = base_line; gboolean started = FALSE;
+
+    sf_push(sf, SF_START, 0, base_line, "START");
+    for (int i = 0; i < len; i++) {
+        char c = body[i];
+        if (c=='/' && i+1<len && body[i+1]=='/') {
+            while (i<len && body[i]!='\n') i++;
+            line++; continue;
+        }
+        if (c=='/' && i+1<len && body[i+1]=='*') {
+            i += 2;
+            while (i+1<len && !(body[i]=='*'&&body[i+1]=='/')) { if(body[i]=='\n')line++; i++; }
+            i++; continue;
+        }
+        if (c=='"' || c=='\'') {
+            char q = c;
+            if (!started) { stmt_line = line; started = TRUE; }
+            g_string_append_c(buf, c); i++;
+            while (i<len && body[i]!=q) {
+                if (body[i]=='\\') { g_string_append_c(buf, body[i]); i++; if(i<len){g_string_append_c(buf,body[i]);i++;} continue; }
+                if (body[i]=='\n') line++;
+                g_string_append_c(buf, body[i]); i++;
+            }
+            if (i<len) g_string_append_c(buf, body[i]);
+            continue;
+        }
+        if (c=='\n') line++;
+        if (c=='(') paren++;
+        else if (c==')') { if (paren>0) paren--; }
+
+        if ((c=='{'||c=='}'||c==';') && paren==0) {
+            char *stmt = g_strstrip(g_strdup(buf->str));
+            if (*stmt) sf_push(sf, classify_stmt(stmt), depth, stmt_line, stmt);
+            g_free(stmt);
+            if (c=='{') depth++;
+            else if (c=='}' && depth>0) depth--;
+            g_string_truncate(buf, 0); started = FALSE;
+            continue;
+        }
+        if (!started && !g_ascii_isspace(c)) { stmt_line = line; started = TRUE; }
+        g_string_append_c(buf, c);
+    }
+    char *stmt = g_strstrip(g_strdup(buf->str));
+    if (*stmt) sf_push(sf, classify_stmt(stmt), depth, stmt_line, stmt);
+    g_free(stmt);
+    g_string_free(buf, TRUE);
+    sf_push(sf, SF_END, 0, line, "END");
+}
+
+static void sf_layout(StepFlow *sf, cairo_t *cr)
+{
+    const double margin=30, indent=26, vgap=22;
+    double y = margin, maxw = 0;
+    for (int i = 0; i < sf->n; i++) {
+        double tw = text_width(cr, sf->text[i], 13);
+        double w = tw + 34; if (w<90) w=90; if (w>560) w=560;
+        double h = 34;
+        if (sf->type[i]==SF_DECISION||sf->type[i]==SF_LOOP) { w+=34; h=42; }
+        sf->w[i]=w; sf->h[i]=h;
+        sf->x[i]=margin + sf->depth[i]*indent;
+        sf->y[i]=y; y += h + vgap;
+        if (sf->x[i]+w > maxw) maxw = sf->x[i]+w;
+    }
+    sf->width = maxw + margin;
+    sf->height = y + margin;
+}
+
+static void sf_shape(cairo_t *cr, int type, double x, double y, double w, double h)
+{
+    if (type==SF_DECISION) {
+        cairo_move_to(cr,x,y+h/2); cairo_line_to(cr,x+w/2,y);
+        cairo_line_to(cr,x+w,y+h/2); cairo_line_to(cr,x+w/2,y+h);
+        cairo_close_path(cr);
+    } else if (type==SF_LOOP) {
+        double in=16;
+        cairo_move_to(cr,x+in,y); cairo_line_to(cr,x+w-in,y);
+        cairo_line_to(cr,x+w,y+h/2); cairo_line_to(cr,x+w-in,y+h);
+        cairo_line_to(cr,x+in,y+h); cairo_line_to(cr,x,y+h/2);
+        cairo_close_path(cr);
+    } else {   /* rounded rectangle (pill for START/END/RETURN) */
+        double r = (type==SF_START||type==SF_END||type==SF_RETURN) ? h/2 : 6;
+        cairo_new_sub_path(cr);
+        cairo_arc(cr,x+w-r,y+r,r,-G_PI_2,0);
+        cairo_arc(cr,x+w-r,y+h-r,r,0,G_PI_2);
+        cairo_arc(cr,x+r,y+h-r,r,G_PI_2,G_PI);
+        cairo_arc(cr,x+r,y+r,r,G_PI,1.5*G_PI);
+        cairo_close_path(cr);
+    }
+}
+
+static gboolean sf_draw(GtkWidget *area, cairo_t *cr, gpointer data)
+{
+    StepFlow *sf = data; (void)area;
+    cairo_set_source_rgb(cr,1,1,1); cairo_paint(cr);
+    double z = sf->zoom>0?sf->zoom:1.0; cairo_scale(cr,z,z);
+    cairo_select_font_face(cr,"monospace",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(cr,13);
+    if (sf->width==0) sf_layout(sf,cr);
+
+    /* connectors */
+    cairo_set_line_width(cr,1.5);
+    for (int i=0;i+1<sf->n;i++) {
+        double ax=sf->x[i]+sf->w[i]/2, ay=sf->y[i]+sf->h[i];
+        double bx=sf->x[i+1]+sf->w[i+1]/2, by=sf->y[i+1];
+        cairo_set_source_rgb(cr,0.45,0.5,0.55);
+        cairo_move_to(cr,ax,ay);
+        if (fabs(ax-bx)<1) cairo_line_to(cr,bx,by);
+        else { double my=(ay+by)/2; cairo_line_to(cr,ax,my); cairo_line_to(cr,bx,my); cairo_line_to(cr,bx,by); }
+        cairo_stroke(cr);
+        cairo_move_to(cr,bx,by); cairo_line_to(cr,bx-4,by-7);
+        cairo_move_to(cr,bx,by); cairo_line_to(cr,bx+4,by-7); cairo_stroke(cr);
+    }
+
+    for (int i=0;i<sf->n;i++) {
+        int t=sf->type[i];
+        double x=sf->x[i],y=sf->y[i],w=sf->w[i],h=sf->h[i];
+        double fr,fg,fb_,sr,sg,sb;
+        switch(t){
+          case SF_START: case SF_END: fr=0.85;fg=0.88;fb_=0.92; sr=0.3;sg=0.35;sb=0.4; break;
+          case SF_ASSIGN:  fr=0.88;fg=0.96;fb_=0.88; sr=0.2;sg=0.55;sb=0.3; break;
+          case SF_DECISION:fr=0.99;fg=0.95;fb_=0.80; sr=0.75;sg=0.55;sb=0.1; break;
+          case SF_LOOP:    fr=0.99;fg=0.90;fb_=0.80; sr=0.80;sg=0.45;sb=0.1; break;
+          case SF_RETURN:  fr=0.99;fg=0.88;fb_=0.88; sr=0.75;sg=0.2;sb=0.2; break;
+          case SF_LABEL:   fr=1;fg=1;fb_=1; sr=0.6;sg=0.6;sb=0.6; break;
+          default:         fr=0.90;fg=0.94;fb_=0.99; sr=0.21;sg=0.42;sb=0.6; break;
+        }
+        if (t!=SF_LABEL) {
+            sf_shape(cr,t,x,y,w,h);
+            cairo_set_source_rgb(cr,fr,fg,fb_); cairo_fill_preserve(cr);
+            cairo_set_source_rgb(cr,sr,sg,sb); cairo_set_line_width(cr,1.5); cairo_stroke(cr);
+        }
+        cairo_set_source_rgb(cr, t==SF_LABEL?0.5:0.12, t==SF_LABEL?0.5:0.12, t==SF_LABEL?0.5:0.15);
+        cairo_text_extents_t te; cairo_text_extents(cr,sf->text[i],&te);
+        cairo_move_to(cr, x+(w-te.width)/2-te.x_bearing, y+(h-te.height)/2-te.y_bearing);
+        cairo_show_text(cr,sf->text[i]);
+    }
+    return FALSE;
+}
+
+static int sf_hit(StepFlow *sf, double x, double y)
+{
+    for (int i=sf->n-1;i>=0;i--)
+        if (x>=sf->x[i]&&x<=sf->x[i]+sf->w[i]&&y>=sf->y[i]&&y<=sf->y[i]+sf->h[i])
+            return i;
+    return -1;
+}
+static gboolean sf_press(GtkWidget *a, GdkEventButton *ev, gpointer d)
+{ (void)a; StepFlow *sf=d; if(ev->button!=1)return FALSE; sf->press_x=ev->x; sf->press_y=ev->y; return TRUE; }
+static gboolean sf_motion(GtkWidget *a, GdkEventMotion *ev, gpointer d)
+{
+    StepFlow *sf=d; GdkWindow *gw=gtk_widget_get_window(a);
+    if (gw) {
+        int over=sf_hit(sf,ev->x/sf->zoom,ev->y/sf->zoom);
+        GdkCursor *c=over>=0?gdk_cursor_new_from_name(gtk_widget_get_display(a),"pointer"):NULL;
+        gdk_window_set_cursor(gw,c); if(c)g_object_unref(c);
+    }
+    return FALSE;
+}
+static gboolean sf_release(GtkWidget *a, GdkEventButton *ev, gpointer d)
+{
+    (void)a; StepFlow *sf=d; if(ev->button!=1)return FALSE;
+    if (fabs(ev->x-sf->press_x)<4 && fabs(ev->y-sf->press_y)<4) {
+        int i=sf_hit(sf,ev->x/sf->zoom,ev->y/sf->zoom);
+        if (i>=0) {
+            if (sf->file) open_at_line(sf->file, sf->line[i]);
+            else          goto_line_current(sf->line[i]);
+            gtk_window_present(GTK_WINDOW(app.window));
+        }
+    }
+    return TRUE;
+}
+static void sf_apply_zoom(StepFlow *sf)
+{ if(!sf->area)return; gtk_widget_set_size_request(sf->area,(int)(sf->width*sf->zoom),(int)(sf->height*sf->zoom)); gtk_widget_queue_draw(sf->area); }
+static void sf_zin (GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf->zoom=MIN(sf->zoom*1.2,4.0);sf_apply_zoom(sf);}
+static void sf_zout(GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf->zoom=MAX(sf->zoom/1.2,0.25);sf_apply_zoom(sf);}
+static void sf_zrst(GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf->zoom=1.0;sf_apply_zoom(sf);}
+static gboolean sf_scroll(GtkWidget *a,GdkEventScroll *ev,gpointer d)
+{ (void)a; StepFlow*sf=d; if(!(ev->state&GDK_CONTROL_MASK))return FALSE;
+  if(ev->direction==GDK_SCROLL_UP)sf->zoom=MIN(sf->zoom*1.1,4.0);
+  else if(ev->direction==GDK_SCROLL_DOWN)sf->zoom=MAX(sf->zoom/1.1,0.25);
+  else return FALSE; sf_apply_zoom(sf); return TRUE; }
+static void sf_save(GtkButton *b,gpointer d)
+{
+    (void)b; StepFlow *sf=d;
+    GtkWidget *dlg=gtk_file_chooser_dialog_new("Save Flowchart as PNG",
+        GTK_WINDOW(app.window),GTK_FILE_CHOOSER_ACTION_SAVE,
+        "Cancel",GTK_RESPONSE_CANCEL,"Save",GTK_RESPONSE_ACCEPT,NULL);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg),"flowchart.png");
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg),TRUE);
+    if (gtk_dialog_run(GTK_DIALOG(dlg))==GTK_RESPONSE_ACCEPT) {
+        char *path=gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+        double zp=sf->zoom; sf->zoom=1.0;
+        cairo_surface_t *s=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,(int)sf->width,(int)sf->height);
+        cairo_t *cr=cairo_create(s); sf_draw(NULL,cr,sf);
+        cairo_surface_write_to_png(s,path); cairo_destroy(cr); cairo_surface_destroy(s);
+        sf->zoom=zp; g_free(path);
+    }
+    gtk_widget_destroy(dlg);
+}
+static void sf_destroy(GtkWidget *w,gpointer d)
+{ (void)w; StepFlow *sf=d; for(int i=0;i<sf->n;i++)g_free(sf->text[i]); g_free(sf->file); g_free(sf); }
+
+static void show_stepflow_window(StepFlow *sf, const char *fname)
+{
+    cairo_surface_t *tmp=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,1,1);
+    cairo_t *mcr=cairo_create(tmp);
+    cairo_select_font_face(mcr,"monospace",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(mcr,13); sf_layout(sf,mcr);
+    cairo_destroy(mcr); cairo_surface_destroy(tmp);
+
+    double fit=MIN(1040.0/sf->width,740.0/sf->height);
+    if(fit>1.0)fit=1.0; if(fit<0.2)fit=0.2; sf->zoom=fit;
+
+    GtkWidget *win=gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    char *title=g_strdup_printf("Detailed Flow — %s()  (%d steps)", fname, sf->n);
+    gtk_window_set_title(GTK_WINDOW(win),title); g_free(title);
+    gtk_window_set_transient_for(GTK_WINDOW(win),GTK_WINDOW(app.window));
+    gtk_window_set_default_size(GTK_WINDOW(win),
+        (int)CLAMP(sf->width*sf->zoom+40,420,900),
+        (int)CLAMP(sf->height*sf->zoom+90,320,820));
+
+    GtkWidget *vb=gtk_box_new(GTK_ORIENTATION_VERTICAL,0);
+    gtk_container_add(GTK_CONTAINER(win),vb);
+    GtkWidget *bar=gtk_box_new(GTK_ORIENTATION_HORIZONTAL,6);
+    gtk_container_set_border_width(GTK_CONTAINER(bar),6);
+    GtkWidget *zo=gtk_button_new_from_icon_name("zoom-out",GTK_ICON_SIZE_BUTTON);
+    GtkWidget *zr=gtk_button_new_from_icon_name("zoom-original",GTK_ICON_SIZE_BUTTON);
+    GtkWidget *zi=gtk_button_new_from_icon_name("zoom-in",GTK_ICON_SIZE_BUTTON);
+    g_signal_connect(zo,"clicked",G_CALLBACK(sf_zout),sf);
+    g_signal_connect(zr,"clicked",G_CALLBACK(sf_zrst),sf);
+    g_signal_connect(zi,"clicked",G_CALLBACK(sf_zin),sf);
+    gtk_box_pack_start(GTK_BOX(bar),zo,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(bar),zr,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(bar),zi,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(bar),gtk_label_new(
+        "green = variable processing · yellow = decision · orange = loop · "
+        "red = return · click a step to jump to code"),FALSE,FALSE,8);
+    GtkWidget *sv=gtk_button_new_with_label("Save as PNG…");
+    g_signal_connect(sv,"clicked",G_CALLBACK(sf_save),sf);
+    gtk_box_pack_end(GTK_BOX(bar),sv,FALSE,FALSE,0);
+    gtk_box_pack_start(GTK_BOX(vb),bar,FALSE,FALSE,0);
+
+    GtkWidget *sw=gtk_scrolled_window_new(NULL,NULL);
+    GtkWidget *area=gtk_drawing_area_new(); sf->area=area;
+    gtk_widget_set_size_request(area,(int)(sf->width*sf->zoom),(int)(sf->height*sf->zoom));
+    gtk_widget_add_events(area,GDK_BUTTON_PRESS_MASK|GDK_BUTTON_RELEASE_MASK|
+                               GDK_POINTER_MOTION_MASK|GDK_SCROLL_MASK);
+    g_signal_connect(area,"draw",G_CALLBACK(sf_draw),sf);
+    g_signal_connect(area,"button-press-event",G_CALLBACK(sf_press),sf);
+    g_signal_connect(area,"motion-notify-event",G_CALLBACK(sf_motion),sf);
+    g_signal_connect(area,"button-release-event",G_CALLBACK(sf_release),sf);
+    g_signal_connect(area,"scroll-event",G_CALLBACK(sf_scroll),sf);
+    gtk_container_add(GTK_CONTAINER(sw),area);
+    gtk_box_pack_start(GTK_BOX(vb),sw,TRUE,TRUE,0);
+    g_signal_connect(win,"destroy",G_CALLBACK(sf_destroy),sf);
+    gtk_widget_show_all(win);
+}
+
+static void act_detailed_flow(GtkWidget *w, gpointer d)
+{
+    (void)w;(void)d;
+    Document *doc = current_document();
+    if (!doc) return;
+    GtkTextBuffer *b = GTK_TEXT_BUFFER(doc->buffer);
+    GtkTextIter s,e; gtk_text_buffer_get_bounds(b,&s,&e);
+    char *text = gtk_text_buffer_get_text(b,&s,&e,FALSE);
+    GtkTextIter cur;
+    gtk_text_buffer_get_iter_at_mark(b,&cur,gtk_text_buffer_get_insert(b));
+    int cur_line = gtk_text_iter_get_line(&cur);   /* 0-based */
+
+    gssize len = strlen(text);
+    GRegex *re = g_regex_new("([A-Za-z_]\\w*)\\s*\\(([^()]*)\\)\\s*\\{",
+                             G_REGEX_MULTILINE, 0, NULL);
+    GMatchInfo *mi = NULL;
+    g_regex_match(re, text, 0, &mi);
+    gssize best_brace=-1, best_bend=-1; char *best_name=NULL;
+    while (g_match_info_matches(mi)) {
+        char *nm=g_match_info_fetch(mi,1);
+        int st,en; g_match_info_fetch_pos(mi,0,&st,&en);
+        if (!is_c_keyword(nm)) {
+            gssize ls=st; while(ls>0&&text[ls-1]!='\n')ls--;
+            gboolean okrt=TRUE;
+            for(gssize p=ls;p<st&&okrt;p++){char c=text[p];
+                if(c==')'||c=='('||c==','||c==';'||c=='=')okrt=FALSE;
+                else if(c==':'){gboolean sc=(p+1<st&&text[p+1]==':')||(p>ls&&text[p-1]==':'); if(!sc)okrt=FALSE;}}
+            gssize brace=en-1, bend=match_brace(text,len,brace);
+            if (okrt && bend>brace) {
+                int sline=0; for(gssize p=0;p<brace;p++) if(text[p]=='\n')sline++;
+                int eline=0; for(gssize p=0;p<bend;p++) if(text[p]=='\n')eline++;
+                if (cur_line>=sline && cur_line<=eline) {
+                    best_brace=brace; best_bend=bend;
+                    g_free(best_name); best_name=g_strdup(nm);
+                }
+            }
+        }
+        g_free(nm); g_match_info_next(mi,NULL);
+    }
+    if(mi)g_match_info_free(mi); g_regex_unref(re);
+
+    if (best_brace<0) {
+        g_free(text); g_free(best_name);
+        GtkWidget *dlg=gtk_message_dialog_new(GTK_WINDOW(app.window),
+            GTK_DIALOG_MODAL,GTK_MESSAGE_INFO,GTK_BUTTONS_OK,
+            "Place the cursor inside a C/C++ function.\n"
+            "The detailed flow diagram shows that function's control flow "
+            "and variable processing.");
+        gtk_window_set_title(GTK_WINDOW(dlg),"Detailed Flow");
+        gtk_dialog_run(GTK_DIALOG(dlg)); gtk_widget_destroy(dlg);
+        return;
+    }
+
+    int base_line=1; for(gssize p=0;p<best_brace;p++) if(text[p]=='\n')base_line++;
+    char *body=g_strndup(text+best_brace+1, best_bend-(best_brace+1));
+    StepFlow *sf=g_new0(StepFlow,1);
+    sf->zoom=1.0;
+    sf->file = doc->path ? g_strdup(doc->path) : NULL;
+    parse_steps(sf, body, base_line);
+    g_free(body); g_free(text);
+    show_stepflow_window(sf, best_name);
+    g_free(best_name);
+}
+
+/* ===================================================================== */
+/*  Symbol tooltips (mouse-over)                                           */
+/* ===================================================================== */
+
+/* Look up `word` in the buffer: if it is a function defined there, return its
+   signature; if it is a declared variable, return its declaration. NULL if
+   nothing is found. Caller frees. */
+static char *lookup_symbol_info(GtkTextBuffer *b, const char *word)
+{
+    if (!word || !*word || is_c_keyword(word)) return NULL;
+    GtkTextIter s, e;
+    gtk_text_buffer_get_bounds(b, &s, &e);
+    char *text = gtk_text_buffer_get_text(b, &s, &e, FALSE);
+    char *esc = g_regex_escape_string(word, -1);
+    char *info = NULL;
+
+    /* function definition: <rettype> word ( params ) { */
+    char *pat = g_strdup_printf(
+        "([A-Za-z_][\\w \\t\\*&:<>]*?)\\b%s\\s*\\(([^;{}]*)\\)\\s*\\{", esc);
+    GRegex *re = g_regex_new(pat, G_REGEX_MULTILINE, 0, NULL);
+    GMatchInfo *mi = NULL;
+    if (re && g_regex_match(re, text, 0, &mi)) {
+        char *rtf = g_match_info_fetch(mi, 1);
+        char *pf  = g_match_info_fetch(mi, 2);
+        char *rt = collapse_ws(rtf);
+        char *pp = collapse_ws(pf);
+        int st, en; g_match_info_fetch_pos(mi, 0, &st, &en);
+        int line = 1; for (int i = 0; i < st && text[i]; i++) if (text[i]=='\n') line++;
+        info = g_strdup_printf("Function  (line %d)\n%s%s%s(%s)",
+            line, rt, *rt ? " " : "", word, *pp ? pp : "void");
+        g_free(rtf); g_free(pf); g_free(rt); g_free(pp);
+    }
+    if (mi) g_match_info_free(mi);
+    if (re) g_regex_unref(re);
+    g_free(pat);
+
+    /* variable declaration: <type> word (= | ; | [ | ,) */
+    if (!info) {
+        char *pat2 = g_strdup_printf(
+            "(?m)^[ \\t]*([A-Za-z_][\\w \\t\\*&:<>]*?[ \\t\\*&])%s"
+            "\\s*(?:\\[[^\\]]*\\])?\\s*(?:=[^=]|;|,)", esc);
+        GRegex *re2 = g_regex_new(pat2, 0, 0, NULL);
+        GMatchInfo *mi2 = NULL;
+        if (re2 && g_regex_match(re2, text, 0, &mi2)) {
+            char *tf = g_match_info_fetch(mi2, 1);
+            char *ty = collapse_ws(tf);
+            char first[32]; g_strlcpy(first, ty, sizeof first);
+            char *sp = strchr(first, ' '); if (sp) *sp = 0;
+            int st, en; g_match_info_fetch_pos(mi2, 0, &st, &en);
+            int line = 1; for (int i = 0; i < st && text[i]; i++) if (text[i]=='\n') line++;
+            if (!is_c_keyword(first) && strcmp(first, "return"))
+                info = g_strdup_printf("Variable  (line %d)\n%s %s", line, ty, word);
+            g_free(tf); g_free(ty);
+        }
+        if (mi2) g_match_info_free(mi2);
+        if (re2) g_regex_unref(re2);
+        g_free(pat2);
+    }
+
+    g_free(esc);
+    g_free(text);
+    return info;
+}
+
+static gboolean on_query_tooltip(GtkWidget *view, int x, int y, gboolean kbd,
+                                 GtkTooltip *tip, gpointer u)
+{
+    (void)u;
+    if (!app.hover_tooltips || kbd) return FALSE;
+    GtkTextView *tv = GTK_TEXT_VIEW(view);
+    int bx, by;
+    gtk_text_view_window_to_buffer_coords(tv, GTK_TEXT_WINDOW_WIDGET,
+                                          x, y, &bx, &by);
+    GtkTextIter it;
+    gtk_text_view_get_iter_at_location(tv, &it, bx, by);
+    if (!gtk_text_iter_inside_word(&it) && !gtk_text_iter_ends_word(&it))
+        return FALSE;
+
+    GtkTextIter s = it, e = it;
+    if (!gtk_text_iter_starts_word(&s)) gtk_text_iter_backward_word_start(&s);
+    if (!gtk_text_iter_ends_word(&e))   gtk_text_iter_forward_word_end(&e);
+    GtkTextBuffer *b = gtk_text_view_get_buffer(tv);
+    char *word = gtk_text_buffer_get_text(b, &s, &e, FALSE);
+    char *info = lookup_symbol_info(b, word);
+    g_free(word);
+    if (!info) return FALSE;
+
+    gtk_tooltip_set_text(tip, info);
+    g_free(info);
+    return TRUE;
+}
+
+/* ===================================================================== */
 /*  View actions                                                          */
 /* ===================================================================== */
 
@@ -2545,6 +3237,25 @@ static void _apply_lnum(Document *doc)
 static void act_line_numbers(GtkWidget *w, gpointer d)
 { (void)d; app.show_line_numbers = gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(w));
   foreach_view(_apply_lnum); }
+
+static void _apply_tooltips(Document *doc)
+{ gtk_widget_set_has_tooltip(doc->view, app.hover_tooltips); }
+static void act_tooltips(GtkWidget *w, gpointer d)
+{ (void)d; app.hover_tooltips = gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(w));
+  foreach_view(_apply_tooltips); }
+
+static void _apply_autocomplete(Document *doc)
+{
+    GtkSourceCompletion *comp =
+        gtk_source_view_get_completion(GTK_SOURCE_VIEW(doc->view));
+    GtkSourceCompletionProvider *p =
+        GTK_SOURCE_COMPLETION_PROVIDER(doc->words);
+    if (app.autocomplete) gtk_source_completion_add_provider(comp, p, NULL);
+    else                  gtk_source_completion_remove_provider(comp, p, NULL);
+}
+static void act_autocomplete(GtkWidget *w, gpointer d)
+{ (void)d; app.autocomplete = gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(w));
+  foreach_view(_apply_autocomplete); }
 
 static void act_zoom_in(GtkWidget *w, gpointer d)
 { (void)w;(void)d; if (app.font_size < 72) app.font_size++; apply_font_css(); }
@@ -2677,7 +3388,13 @@ static const char *HELP_MARKUP =
 
 "<b>View</b>\n"
 "Word wrap, show/hide line numbers, zoom in (Ctrl++), zoom out (Ctrl+-), "
-"reset zoom (Ctrl+0), and a choice of color themes.\n\n"
+"reset zoom (Ctrl+0), color themes, optional <b>symbol tooltips</b> "
+"(hover a function or variable) and optional <b>auto-completion</b> "
+"(Ctrl+Space, word completion from the document).\n\n"
+
+"<b>Recent files &amp; session</b>\n"
+"File &gt; Open Recent lists the last files you opened. When you start tuxpad "
+"with no file arguments, the files from your previous session are reopened.\n\n"
 
 "<b>Tools</b>\n"
 "• <b>Format Document</b> (Ctrl+Shift+I): reformats the file using "
@@ -2697,7 +3414,10 @@ static const char *HELP_MARKUP =
 "    – <b>Save as PNG</b>.\n"
 "• <b>Flow Diagram (Directory)</b> (Shift+F8): the same, but combining every "
 "C/C++ file in the folder of the currently open file (cross-file calls "
-"included; open files use their live, unsaved contents).\n\n"
+"included; open files use their live, unsaved contents).\n"
+"• <b>Detailed Flow</b> (F9): a flowchart of the function at the cursor showing "
+"the control-flow structure (decisions, loops, returns) and variable "
+"processing (assignments in green). Click a step to jump to its line.\n\n"
 
 "<b>Language</b>\n"
 "The language is detected automatically from the file name or its content; you "
@@ -2721,9 +3441,10 @@ static const char *HELP_MARKUP =
 "Ctrl+O Open       Ctrl+H Replace      F7     Syntax Check\n"
 "Ctrl+S Save       Ctrl+Shift+F Find in Files  F8  Flow Diagram\n"
 "Ctrl+W Close      Ctrl+G Go to Line   Shift+F8 Flow (Directory)\n"
-"Ctrl+P Print      Ctrl+Shift+I Format  Ctrl++ / Ctrl+- Zoom\n"
-"Ctrl+Z Undo       Ctrl+Y Redo         Ctrl+0  Reset Zoom\n"
-"Ctrl+A Select All Ctrl+Q Exit         F1      This help\n"
+"Ctrl+P Print      Ctrl+Shift+I Format  F9     Detailed Flow\n"
+"Ctrl+Z Undo       Ctrl+Y Redo         Ctrl+Space Auto-complete\n"
+"Ctrl+A Select All Ctrl+Q Exit         Ctrl++/- /0 Zoom\n"
+"F1 Help\n"
 "</tt>\n\n"
 
 "<b>Author</b>\n"
@@ -2817,6 +3538,11 @@ static GtkWidget *build_menubar(void)
     GtkWidget *m = add_submenu(bar, "_File");
     add_item(m, "_New",          G_CALLBACK(act_new),     GDK_KEY_n, GDK_CONTROL_MASK);
     add_item(m, "_Open...",      G_CALLBACK(act_open),    GDK_KEY_o, GDK_CONTROL_MASK);
+    GtkWidget *recent_item = gtk_menu_item_new_with_mnemonic("Open _Recent");
+    app.recent_menu = gtk_menu_new();
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(recent_item), app.recent_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(m), recent_item);
+    rebuild_recent_menu();
     add_sep(m);
     add_item(m, "_Save",         G_CALLBACK(act_save),    GDK_KEY_s, GDK_CONTROL_MASK);
     add_item(m, "Save _As...",   G_CALLBACK(act_save_as), GDK_KEY_s, GDK_CONTROL_MASK|GDK_SHIFT_MASK);
@@ -2861,6 +3587,16 @@ static GtkWidget *build_menubar(void)
     gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(lnum), TRUE);
     g_signal_connect(lnum, "toggled", G_CALLBACK(act_line_numbers), NULL);
     gtk_menu_shell_append(GTK_MENU_SHELL(m), lnum);
+    GtkWidget *ttip = gtk_check_menu_item_new_with_mnemonic(
+        "Symbol _Tooltips (mouse-over)");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(ttip), app.hover_tooltips);
+    g_signal_connect(ttip, "toggled", G_CALLBACK(act_tooltips), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(m), ttip);
+    GtkWidget *acmp = gtk_check_menu_item_new_with_mnemonic(
+        "_Auto-completion (Ctrl+Space)");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(acmp), app.autocomplete);
+    g_signal_connect(acmp, "toggled", G_CALLBACK(act_autocomplete), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(m), acmp);
     add_sep(m);
     add_item(m, "Zoom _In",      G_CALLBACK(act_zoom_in),    GDK_KEY_plus,  GDK_CONTROL_MASK);
     add_item(m, "Zoom _Out",     G_CALLBACK(act_zoom_out),   GDK_KEY_minus, GDK_CONTROL_MASK);
@@ -2880,6 +3616,8 @@ static GtkWidget *build_menubar(void)
              GDK_KEY_F8, 0);
     add_item(m, "Flow Diagram (_Directory of current file)",
              G_CALLBACK(act_flow_diagram_dir), GDK_KEY_F8, GDK_SHIFT_MASK);
+    add_item(m, "Detailed Flow (current function)",
+             G_CALLBACK(act_detailed_flow), GDK_KEY_F9, 0);
 
     /* Language */
     GtkWidget *lang_item = gtk_menu_item_new_with_mnemonic("_Language");
@@ -3002,7 +3740,9 @@ static void on_drag_received(GtkWidget *w, GdkDragContext *ctx, gint x, gint y,
 static gboolean on_delete(GtkWidget *w, GdkEvent *e, gpointer d)
 {
     (void)w;(void)e;(void)d;
-    return !confirm_quit();   /* TRUE stops the destroy */
+    if (!confirm_quit()) return TRUE;   /* cancelled: stop the destroy */
+    save_session();
+    return FALSE;
 }
 
 /* ===================================================================== */
@@ -3116,10 +3856,58 @@ static int flow_png_export(const char *src, const char *out)
     return rc;
 }
 
+/* Headless export of the detailed flowchart of the first function in a file. */
+static int stepflow_png_export(const char *src, const char *out)
+{
+    char *text = NULL;
+    if (!g_file_get_contents(src, &text, NULL, NULL)) {
+        g_printerr("tuxpad: cannot read %s\n", src); return 1;
+    }
+    gssize len = strlen(text);
+    GRegex *re = g_regex_new("([A-Za-z_]\\w*)\\s*\\(([^()]*)\\)\\s*\\{",
+                             G_REGEX_MULTILINE, 0, NULL);
+    GMatchInfo *mi = NULL; g_regex_match(re, text, 0, &mi);
+    gssize brace=-1, bend=-1; char *fname=NULL;
+    while (g_match_info_matches(mi) && brace<0) {
+        char *nm=g_match_info_fetch(mi,1); int st,en;
+        g_match_info_fetch_pos(mi,0,&st,&en);
+        if (!is_c_keyword(nm)) {
+            gssize ls=st; while(ls>0&&text[ls-1]!='\n')ls--;
+            gboolean okrt=TRUE;
+            for(gssize p=ls;p<st&&okrt;p++){char c=text[p];
+                if(c==')'||c=='('||c==','||c==';'||c=='=')okrt=FALSE;}
+            gssize br=en-1, be=match_brace(text,len,br);
+            if(okrt&&be>br){ brace=br; bend=be; fname=g_strdup(nm); }
+        }
+        g_free(nm); g_match_info_next(mi,NULL);
+    }
+    if(mi)g_match_info_free(mi); g_regex_unref(re);
+    if (brace<0){ g_printerr("tuxpad: no function found\n"); g_free(text); return 2; }
+
+    int base_line=1; for(gssize p=0;p<brace;p++) if(text[p]=='\n')base_line++;
+    char *body=g_strndup(text+brace+1,bend-(brace+1));
+    StepFlow *sf=g_new0(StepFlow,1); sf->zoom=1.0;
+    parse_steps(sf, body, base_line); g_free(body); g_free(text);
+
+    cairo_surface_t *m=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,1,1);
+    cairo_t *mc=cairo_create(m);
+    cairo_select_font_face(mc,"monospace",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_NORMAL);
+    sf_layout(sf,mc); cairo_destroy(mc); cairo_surface_destroy(m);
+    cairo_surface_t *s=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,(int)sf->width,(int)sf->height);
+    cairo_t *cr=cairo_create(s); sf_draw(NULL,cr,sf);
+    cairo_surface_write_to_png(s,out); cairo_destroy(cr); cairo_surface_destroy(s);
+    g_print("Wrote %s (%dx%d, %d steps, function %s)\n",
+            out,(int)sf->width,(int)sf->height,sf->n,fname);
+    g_free(fname); sf_destroy(NULL,sf);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc >= 4 && !strcmp(argv[1], "--flow-png"))
         return flow_png_export(argv[2], argv[3]);
+    if (argc >= 4 && !strcmp(argv[1], "--stepflow-png"))
+        return stepflow_png_export(argv[2], argv[3]);
 
     ensure_font_schema(argv);
     gtk_init(&argc, &argv);
@@ -3130,6 +3918,9 @@ int main(int argc, char **argv)
     app.font_size = 11;
     app.word_wrap = FALSE;
     app.show_line_numbers = TRUE;
+    app.hover_tooltips = TRUE;
+    app.autocomplete = TRUE;
+    load_recent();
 
     /* Choose a pleasant default scheme if available */
     const char *prefer[] = {"classic", "tango", "kate", NULL};
@@ -3209,6 +4000,8 @@ int main(int argc, char **argv)
             opened = TRUE;
         }
     }
+    /* No files on the command line: restore the previous session. */
+    if (!opened && restore_session() > 0) opened = TRUE;
     if (!opened) document_new(NULL);
 
     update_status_bar();

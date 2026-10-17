@@ -7,6 +7,12 @@ GtkSourceView.
 
 - **Tabbed editing** — multiple documents, reorderable tabs, close buttons, and
   a `*` modified indicator
+- **Open Recent** and **session restore** — recent-files list, and the open
+  files are reopened automatically on the next start
+- **Auto-completion** (optional) — word completion from the document
+  (Ctrl+Space), toggle in the View menu
+- **Symbol tooltips** (optional) — hover a function or variable to see its
+  signature / declaration; toggle in the View menu
 - **Syntax highlighting** with automatic language detection and a **Language**
   menu covering every GtkSourceView language
 - **Line numbers**, current-line highlight, bracket matching, auto-indent
@@ -39,8 +45,16 @@ GtkSourceView.
       calls included; open files use their live, unsaved contents)
     - Save the diagram as PNG, or generate one headlessly:
       `tuxpad --flow-png file.c out.png`
+  - **Detailed Flow** (F9) — a flowchart of the function at the cursor showing
+    the **control-flow structure** (decisions, loops, returns) and **variable
+    processing** (assignments highlighted in green); click a step to jump to
+    that line. Colors: green = variable processing, yellow = decision,
+    orange = loop, red = return.
 
-![Flow diagram example](docs/flow-demo.png)
+Call graph (F8) and detailed per-function flowchart (F9):
+
+![Call graph example](docs/flow-demo.png)
+![Detailed flowchart example](docs/flowchart-demo.png)
 - **View**: word wrap, zoom in/out/reset, line-number toggle, color themes
 - Notepad++-style **status bar**: length/lines, Ln/Col/Sel, EOL, encoding,
   language
@@ -59,7 +73,8 @@ GtkSourceView.
 | Save All      | Ctrl+Alt+S          | Find in Files  | Ctrl+Shift+F  |
 | Format Doc    | Ctrl+Shift+I        | Go to Line     | Ctrl+G        |
 | Syntax Check  | F7                  | Flow Diagram   | F8            |
-| Flow (Dir.)   | Shift+F8            | Help           | F1            |
+| Flow (Dir.)   | Shift+F8            | Detailed Flow  | F9            |
+| Auto-complete | Ctrl+Space          | Help           | F1            |
 | Close tab     | Ctrl+W              | Zoom In        | Ctrl++        |
 | Print         | Ctrl+P              | Zoom Out       | Ctrl+-        |
 | Undo / Redo   | Ctrl+Z / Ctrl+Y     | Reset Zoom     | Ctrl+0        |
