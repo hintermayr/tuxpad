@@ -2608,6 +2608,7 @@ static gboolean on_flow_press(GtkWidget *area, GdkEventButton *ev, gpointer data
     int i = flow_hit(g, mx, my);
     g->moved = FALSE;
     g->press_x = ev->x; g->press_y = ev->y;
+    g->pan_rx = ev->x_root; g->pan_ry = ev->y_root;  /* stable screen coords */
     g->click_idx = i;                 /* for a pure click (jump to code) */
 
     if ((ev->state & GDK_SHIFT_MASK) && i >= 0) {
@@ -2618,7 +2619,6 @@ static gboolean on_flow_press(GtkWidget *area, GdkEventButton *ev, gpointer data
     } else {
         /* plain drag pans the view (never touches the editor) */
         g->node_drag = FALSE; g->panning = TRUE; g->drag_idx = -1;
-        g->pan_rx = ev->x_root; g->pan_ry = ev->y_root;
         GtkWidget *sw = gtk_widget_get_ancestor(area, GTK_TYPE_SCROLLED_WINDOW);
         if (sw) {
             g->pan_sx = gtk_adjustment_get_value(
@@ -2640,7 +2640,9 @@ static gboolean on_flow_motion(GtkWidget *area, GdkEventMotion *ev, gpointer dat
         set_area_cursor(area, over >= 0 ? "pointer" : "grab");
         return FALSE;
     }
-    if (fabs(ev->x - g->press_x) > 3 || fabs(ev->y - g->press_y) > 3)
+    /* Use screen coords: panning scrolls the canvas, so widget-relative coords
+       barely change even as the pointer moves. */
+    if (fabs(ev->x_root - g->pan_rx) > 3 || fabs(ev->y_root - g->pan_ry) > 3)
         g->moved = TRUE;
 
     if (g->node_drag && g->drag_idx >= 0) {
@@ -3278,7 +3280,7 @@ static gboolean sf_release(GtkWidget *a, GdkEventButton *ev, gpointer d)
 {
     StepFlow *sf=d; if(ev->button!=1)return FALSE;
     sf->panning=FALSE; set_area_cursor(a,"grab");
-    if (fabs(ev->x-sf->press_x)<4 && fabs(ev->y-sf->press_y)<4) {
+    if (fabs(ev->x_root-sf->pan_rx)<4 && fabs(ev->y_root-sf->pan_ry)<4) {
         int i=sf_hit(sf,ev->x/sf->zoom,ev->y/sf->zoom);
         if (i>=0) {
             if (sf->file) open_at_line(sf->file, sf->line[i]);
