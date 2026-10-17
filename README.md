@@ -40,9 +40,9 @@ GtkSourceView.
     - **Zoom in/out** with the toolbar buttons or Ctrl+scroll (zooms toward
       the mouse pointer); a **Compact** toggle shows only signatures for a
       clearer overview
-    - **Drag** a box to rearrange it; **click** a box to open its function in
-      the editor — the editor window is raised and the cursor jumps to the
-      function's definition (hovering a box shows a hand cursor)
+    - **Pan** by dragging the empty canvas; **drag** a box to rearrange it;
+      **click** a box to open its function in the editor — the editor window is
+      raised and the cursor jumps to the function's definition
     - **Flow Diagram (Directory)** (Shift+F8) builds a combined call graph of
       every C/C++ file in the folder of the currently open file (cross-file
       calls included; open files use their live, unsaved contents)

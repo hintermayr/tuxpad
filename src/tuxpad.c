@@ -1862,6 +1862,8 @@ typedef struct {
     double    press_x, press_y, drag_dx, drag_dy;
     double    zoom;                 /* 1.0 = 100%                             */
     gboolean  compact;              /* show only signatures (cleaner view)    */
+    gboolean  panning;              /* dragging the empty canvas              */
+    double    pan_rx, pan_ry, pan_sx, pan_sy;
 } FlowGraph;
 
 static gboolean is_c_keyword(const char *s)
@@ -2506,6 +2508,32 @@ static gboolean scroll_enclosing(GtkWidget *area, GdkEventScroll *ev)
     return TRUE;
 }
 
+static void set_area_cursor(GtkWidget *area, const char *name)
+{
+    GdkWindow *gw = gtk_widget_get_window(area);
+    if (!gw) return;
+    GdkCursor *c = name
+        ? gdk_cursor_new_from_name(gtk_widget_get_display(area), name) : NULL;
+    gdk_window_set_cursor(gw, c);
+    if (c) g_object_unref(c);
+}
+
+/* Pan the scrolled view: keep the grabbed point under the pointer, using
+   stable root (screen) coordinates. */
+static void pan_view(GtkWidget *area, double sx0, double sy0,
+                     double rx0, double ry0, double rx, double ry)
+{
+    GtkWidget *sw = gtk_widget_get_ancestor(area, GTK_TYPE_SCROLLED_WINDOW);
+    if (!sw) return;
+    GtkAdjustment *ha = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(sw));
+    GtkAdjustment *va = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(sw));
+    double nx = sx0 - (rx - rx0), ny = sy0 - (ry - ry0);
+    double hx = gtk_adjustment_get_upper(ha) - gtk_adjustment_get_page_size(ha);
+    double hy = gtk_adjustment_get_upper(va) - gtk_adjustment_get_page_size(va);
+    gtk_adjustment_set_value(ha, CLAMP(nx, 0, MAX(hx, 0)));
+    gtk_adjustment_set_value(va, CLAMP(ny, 0, MAX(hy, 0)));
+}
+
 static gboolean on_flow_scroll(GtkWidget *area, GdkEventScroll *ev, gpointer d)
 {
     FlowGraph *g = d;
@@ -2572,7 +2600,6 @@ static int flow_hit(FlowGraph *g, double x, double y)
 
 static gboolean on_flow_press(GtkWidget *area, GdkEventButton *ev, gpointer data)
 {
-    (void)area;
     FlowGraph *g = data;
     if (ev->button != 1) return FALSE;
     double mx = ev->x / g->zoom, my = ev->y / g->zoom;
@@ -2580,7 +2607,21 @@ static gboolean on_flow_press(GtkWidget *area, GdkEventButton *ev, gpointer data
     g->drag_idx = i;
     g->moved = FALSE;
     g->press_x = ev->x; g->press_y = ev->y;
-    if (i >= 0) { g->drag_dx = mx - g->x[i]; g->drag_dy = my - g->y[i]; }
+    if (i >= 0) {
+        g->panning = FALSE;
+        g->drag_dx = mx - g->x[i]; g->drag_dy = my - g->y[i];
+    } else {
+        g->panning = TRUE;
+        g->pan_rx = ev->x_root; g->pan_ry = ev->y_root;
+        GtkWidget *sw = gtk_widget_get_ancestor(area, GTK_TYPE_SCROLLED_WINDOW);
+        if (sw) {
+            g->pan_sx = gtk_adjustment_get_value(
+                gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(sw)));
+            g->pan_sy = gtk_adjustment_get_value(
+                gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(sw)));
+        }
+        set_area_cursor(area, "grabbing");
+    }
     return TRUE;
 }
 
@@ -2588,18 +2629,16 @@ static gboolean on_flow_motion(GtkWidget *area, GdkEventMotion *ev, gpointer dat
 {
     FlowGraph *g = data;
 
-    /* while not dragging, show a hand cursor over clickable nodes */
+    /* while not dragging: pointer over a node, open hand over empty canvas */
     if (!(ev->state & GDK_BUTTON1_MASK)) {
-        GdkWindow *gw = gtk_widget_get_window(area);
-        if (gw) {
-            int over = flow_hit(g, ev->x / g->zoom, ev->y / g->zoom);
-            GdkCursor *c = over >= 0
-                ? gdk_cursor_new_from_name(gtk_widget_get_display(area), "pointer")
-                : NULL;
-            gdk_window_set_cursor(gw, c);
-            if (c) g_object_unref(c);
-        }
+        int over = flow_hit(g, ev->x / g->zoom, ev->y / g->zoom);
+        set_area_cursor(area, over >= 0 ? "pointer" : "grab");
         return FALSE;
+    }
+    if (g->panning) {
+        pan_view(area, g->pan_sx, g->pan_sy, g->pan_rx, g->pan_ry,
+                 ev->x_root, ev->y_root);
+        return TRUE;
     }
     if (g->drag_idx < 0) return FALSE;
     if (fabs(ev->x - g->press_x) > 3 || fabs(ev->y - g->press_y) > 3)
@@ -2623,10 +2662,10 @@ static gboolean on_flow_motion(GtkWidget *area, GdkEventMotion *ev, gpointer dat
 
 static gboolean on_flow_release(GtkWidget *area, GdkEventButton *ev, gpointer data)
 {
-    (void)area;
     FlowGraph *g = data;
     if (ev->button != 1) return FALSE;
-    if (g->drag_idx >= 0 && !g->moved) {        /* a click: jump to the code */
+    if (g->panning) { g->panning = FALSE; set_area_cursor(area, "grab"); }
+    else if (g->drag_idx >= 0 && !g->moved) {   /* a click: jump to the code */
         int i = g->drag_idx;
         if (g->file[i]) open_at_line(g->file[i], g->def_line[i]);
         else            goto_line_current(g->def_line[i]);
@@ -2710,7 +2749,8 @@ static void show_flow_window(FlowGraph *g, const char *subject)
     gtk_box_pack_start(GTK_BOX(bar), compact, FALSE, FALSE, 0);
 
     GtkWidget *hint = gtk_label_new(
-        "drag · click to jump · Ctrl+scroll to zoom");
+        "drag canvas to pan · drag a box to move it · click to jump · "
+        "Ctrl+scroll to zoom");
     gtk_box_pack_start(GTK_BOX(bar), hint, FALSE, FALSE, 8);
 
     GtkWidget *save = gtk_button_new_with_label("Save as PNG…");
@@ -2856,6 +2896,8 @@ typedef struct {
     GtkWidget *area;
     double  zoom;
     double  press_x, press_y;
+    gboolean panning;
+    double  pan_rx, pan_ry, pan_sx, pan_sy;
 } StepFlow;
 
 #define SF_VGAP 26.0
@@ -3203,20 +3245,35 @@ static int sf_hit(StepFlow *sf, double x, double y)
     return -1;
 }
 static gboolean sf_press(GtkWidget *a, GdkEventButton *ev, gpointer d)
-{ (void)a; StepFlow *sf=d; if(ev->button!=1)return FALSE; sf->press_x=ev->x; sf->press_y=ev->y; return TRUE; }
+{
+    StepFlow *sf=d; if(ev->button!=1)return FALSE;
+    sf->press_x=ev->x; sf->press_y=ev->y;
+    sf->panning=TRUE; sf->pan_rx=ev->x_root; sf->pan_ry=ev->y_root;
+    GtkWidget *sw=gtk_widget_get_ancestor(a,GTK_TYPE_SCROLLED_WINDOW);
+    if(sw){ sf->pan_sx=gtk_adjustment_get_value(gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(sw)));
+            sf->pan_sy=gtk_adjustment_get_value(gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(sw))); }
+    set_area_cursor(a,"grabbing");
+    return TRUE;
+}
 static gboolean sf_motion(GtkWidget *a, GdkEventMotion *ev, gpointer d)
 {
-    StepFlow *sf=d; GdkWindow *gw=gtk_widget_get_window(a);
-    if (gw) {
+    StepFlow *sf=d;
+    if (!(ev->state & GDK_BUTTON1_MASK)) {
         int over=sf_hit(sf,ev->x/sf->zoom,ev->y/sf->zoom);
-        GdkCursor *c=over>=0?gdk_cursor_new_from_name(gtk_widget_get_display(a),"pointer"):NULL;
-        gdk_window_set_cursor(gw,c); if(c)g_object_unref(c);
+        set_area_cursor(a, over>=0 ? "pointer" : "grab");
+        return FALSE;
+    }
+    if (sf->panning) {
+        pan_view(a, sf->pan_sx, sf->pan_sy, sf->pan_rx, sf->pan_ry,
+                 ev->x_root, ev->y_root);
+        return TRUE;
     }
     return FALSE;
 }
 static gboolean sf_release(GtkWidget *a, GdkEventButton *ev, gpointer d)
 {
-    (void)a; StepFlow *sf=d; if(ev->button!=1)return FALSE;
+    StepFlow *sf=d; if(ev->button!=1)return FALSE;
+    sf->panning=FALSE; set_area_cursor(a,"grab");
     if (fabs(ev->x-sf->press_x)<4 && fabs(ev->y-sf->press_y)<4) {
         int i=sf_hit(sf,ev->x/sf->zoom,ev->y/sf->zoom);
         if (i>=0) {
