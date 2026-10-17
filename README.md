@@ -34,7 +34,8 @@ GtkSourceView.
     - **Drag** a box to rearrange it; **click** a box to jump to that function
       in the editor
     - **Flow Diagram (Directory)** (Shift+F8) builds a combined call graph of
-      every C/C++ file in a chosen directory (cross-file calls included)
+      every C/C++ file in the folder of the currently open file (cross-file
+      calls included; open files use their live, unsaved contents)
     - Save the diagram as PNG, or generate one headlessly:
       `tuxpad --flow-png file.c out.png`
 

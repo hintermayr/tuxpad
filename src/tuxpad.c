@@ -2424,26 +2424,36 @@ static void act_flow_diagram(GtkWidget *w, gpointer d)
 }
 
 /* Flow diagram across every C/C++ file in a directory. */
+/* Find an open document by path, so the diagram can use its live (possibly
+   unsaved) buffer contents instead of what is on disk. */
+static Document *find_open_doc(const char *path)
+{
+    gint n = gtk_notebook_get_n_pages(GTK_NOTEBOOK(app.notebook));
+    for (gint i = 0; i < n; i++) {
+        GtkWidget *ch = gtk_notebook_get_nth_page(GTK_NOTEBOOK(app.notebook), i);
+        Document *dc = g_object_get_data(G_OBJECT(ch), "document");
+        if (dc && dc->path && g_strcmp0(dc->path, path) == 0) return dc;
+    }
+    return NULL;
+}
+
 static void act_flow_diagram_dir(GtkWidget *w, gpointer d)
 {
     (void)w;(void)d;
     Document *doc = current_document();
 
-    GtkWidget *dlg = gtk_file_chooser_dialog_new("Flow Diagram — choose directory",
-        GTK_WINDOW(app.window), GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
-        "Cancel", GTK_RESPONSE_CANCEL, "Scan", GTK_RESPONSE_ACCEPT, NULL);
-    if (doc && doc->path) {
-        char *dir = g_path_get_dirname(doc->path);
-        gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(dlg), dir);
-        g_free(dir);
-    }
-    if (gtk_dialog_run(GTK_DIALOG(dlg)) != GTK_RESPONSE_ACCEPT) {
+    /* Use the directory of the currently open file. */
+    if (!doc || !doc->path) {
+        GtkWidget *dlg = gtk_message_dialog_new(GTK_WINDOW(app.window),
+            GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+            "Please save the current file first.\n"
+            "The directory flow diagram scans the folder of the open file.");
+        gtk_window_set_title(GTK_WINDOW(dlg), "Flow Diagram (Directory)");
+        gtk_dialog_run(GTK_DIALOG(dlg));
         gtk_widget_destroy(dlg);
         return;
     }
-    char *dir = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
-    gtk_widget_destroy(dlg);
-    if (!dir) return;
+    char *dir = g_path_get_dirname(doc->path);
 
     const char *exts[] = {".c",".h",".cpp",".cc",".cxx",".hpp",".hh",".hxx",NULL};
     FlowGraph *g = g_new0(FlowGraph, 1);
@@ -2459,13 +2469,26 @@ static void act_flow_diagram_dir(GtkWidget *w, gpointer d)
             if (g_str_has_suffix(name, exts[i])) { ok = TRUE; break; }
         if (!ok) continue;
         char *full = g_build_filename(dir, name, NULL);
-        char *content = NULL;
-        if (g_file_get_contents(full, &content, NULL, NULL) &&
-            g_utf8_validate(content, -1, NULL)) {
+
+        /* prefer the live buffer if this file is open (reflects edits) */
+        Document *od = find_open_doc(full);
+        if (od) {
+            GtkTextBuffer *b = GTK_TEXT_BUFFER(od->buffer);
+            GtkTextIter s, e;
+            gtk_text_buffer_get_bounds(b, &s, &e);
+            char *content = gtk_text_buffer_get_text(b, &s, &e, FALSE);
             flow_add_file(&fb, full, content);
+            g_free(content);
             files++;
+        } else {
+            char *content = NULL;
+            if (g_file_get_contents(full, &content, NULL, NULL) &&
+                g_utf8_validate(content, -1, NULL)) {
+                flow_add_file(&fb, full, content);
+                files++;
+            }
+            g_free(content);
         }
-        g_free(content);
         g_free(full);
     }
     if (gd) g_dir_close(gd);
@@ -2657,7 +2680,8 @@ static const char *HELP_MARKUP =
 "    – <b>zoom</b> with the toolbar buttons or Ctrl+scroll,\n"
 "    – <b>Save as PNG</b>.\n"
 "• <b>Flow Diagram (Directory)</b> (Shift+F8): the same, but combining every "
-"C/C++ file in a chosen directory (cross-file calls included).\n\n"
+"C/C++ file in the folder of the currently open file (cross-file calls "
+"included; open files use their live, unsaved contents).\n\n"
 
 "<b>Language</b>\n"
 "The language is detected automatically from the file name or its content; you "
@@ -2838,8 +2862,8 @@ static GtkWidget *build_menubar(void)
              GDK_KEY_F7, 0);
     add_item(m, "Flow _Diagram",     G_CALLBACK(act_flow_diagram),
              GDK_KEY_F8, 0);
-    add_item(m, "Flow Diagram (_Directory)...", G_CALLBACK(act_flow_diagram_dir),
-             GDK_KEY_F8, GDK_SHIFT_MASK);
+    add_item(m, "Flow Diagram (_Directory of current file)",
+             G_CALLBACK(act_flow_diagram_dir), GDK_KEY_F8, GDK_SHIFT_MASK);
 
     /* Language */
     GtkWidget *lang_item = gtk_menu_item_new_with_mnemonic("_Language");
