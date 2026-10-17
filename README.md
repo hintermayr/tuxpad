@@ -10,7 +10,8 @@ GtkSourceView.
 - **Open Recent** and **session restore** — recent-files list, and the open
   files are reopened automatically on the next start
 - **Auto-completion** (optional) — word completion from the document
-  (Ctrl+Space), toggle in the View menu
+  (Ctrl+Space or Ctrl+Shift+Space to pop up the list; Enter/Tab accept the
+  highlighted suggestion), toggle in the View menu
 - **Symbol tooltips** (optional) — hover a function or variable to see its
   signature / declaration; toggle in the View menu
 - **Syntax highlighting** with automatic language detection and a **Language**
@@ -45,11 +46,11 @@ GtkSourceView.
       calls included; open files use their live, unsaved contents)
     - Save the diagram as PNG, or generate one headlessly:
       `tuxpad --flow-png file.c out.png`
-  - **Detailed Flow** (F9) — a flowchart of the function at the cursor showing
-    the **control-flow structure** (decisions, loops, returns) and **variable
-    processing** (assignments highlighted in green); click a step to jump to
-    that line. Colors: green = variable processing, yellow = decision,
-    orange = loop, red = return.
+  - **Detailed Flow** (F9) — a structured flowchart of the function at the
+    cursor: `if/else` are drawn as **true/false branches** that merge again,
+    loops have a **back-edge**, and **variable processing** (assignments) is
+    highlighted in green. Click a step to jump to that line. Colors:
+    green = variable processing, yellow = decision, orange = loop, red = return.
 
 Call graph (F8) and detailed per-function flowchart (F9):
 

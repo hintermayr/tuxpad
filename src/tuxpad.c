@@ -98,8 +98,11 @@ static void      set_tab_title(Document *doc);
 static void      open_path(const char *path);
 static void      add_recent(const char *path);
 static void      rebuild_recent_menu(void);
+static void      save_session(void);
+static gboolean  session_restoring = FALSE;
 static gboolean  on_query_tooltip(GtkWidget *view, int x, int y, gboolean kbd,
                                   GtkTooltip *tip, gpointer u);
+static gboolean  on_view_key(GtkWidget *view, GdkEventKey *ev, gpointer u);
 
 /* ===================================================================== */
 /*  Font / zoom                                                           */
@@ -329,6 +332,8 @@ static Document *document_new(const char *path)
     gtk_widget_set_has_tooltip(doc->view, app.hover_tooltips);
     g_signal_connect(doc->view, "query-tooltip",
                      G_CALLBACK(on_query_tooltip), NULL);
+    g_signal_connect(doc->view, "key-press-event",
+                     G_CALLBACK(on_view_key), NULL);
 
     /* word auto-completion from the document's own text */
     doc->words = gtk_source_completion_words_new("Document", NULL);
@@ -380,6 +385,7 @@ static void close_document(Document *doc)
     /* doc freed via g_object_set_data_full destroy notify */
     if (gtk_notebook_get_n_pages(GTK_NOTEBOOK(app.notebook)) == 0)
         document_new(NULL);
+    if (!session_restoring) save_session();
 }
 
 static void on_tab_close_clicked(GtkButton *btn, gpointer data)
@@ -513,6 +519,7 @@ static void open_path(const char *path)
     update_title();
     update_status_bar();
     add_recent(path);
+    if (!session_restoring) save_session();
 }
 
 static gboolean save_document(Document *doc, gboolean save_as)
@@ -563,6 +570,8 @@ static gboolean save_document(Document *doc, gboolean save_as)
     set_tab_title(doc);
     update_title();
     update_status_bar();
+    add_recent(path);
+    if (!session_restoring) save_session();
     return TRUE;
 }
 
@@ -687,7 +696,11 @@ static void save_session(void)
     for (gint i = 0; i < n; i++) {
         GtkWidget *ch = gtk_notebook_get_nth_page(GTK_NOTEBOOK(app.notebook), i);
         Document *dc = g_object_get_data(G_OBJECT(ch), "document");
-        if (dc && dc->path) g_string_append_printf(s, "%s\n", dc->path);
+        if (dc && dc->path) {
+            char *abs = g_canonicalize_filename(dc->path, NULL);
+            g_string_append_printf(s, "%s\n", abs);
+            g_free(abs);
+        }
     }
     char *p = config_path("session");
     g_file_set_contents(p, s->str, -1, NULL);
@@ -700,6 +713,7 @@ static int restore_session(void)
     char *p = config_path("session");
     char *data = NULL;
     int opened = 0;
+    session_restoring = TRUE;
     if (g_file_get_contents(p, &data, NULL, NULL)) {
         char **lines = g_strsplit(data, "\n", -1);
         for (int i = 0; lines[i]; i++)
@@ -710,6 +724,7 @@ static int restore_session(void)
         g_free(data);
     }
     g_free(p);
+    session_restoring = FALSE;
     return opened;
 }
 
@@ -2725,39 +2740,30 @@ static void act_flow_diagram_dir(GtkWidget *w, gpointer d)
 /* ===================================================================== */
 
 #define SF_MAX 600
+#define SF_EDGES (SF_MAX*3)
 enum { SF_START, SF_END, SF_PROCESS, SF_ASSIGN, SF_DECISION, SF_LOOP,
-       SF_RETURN, SF_LABEL };
+       SF_RETURN, SF_LABEL, SF_MERGE };
 
 typedef struct {
     char   *text[SF_MAX];
     int     type[SF_MAX];
-    int     depth[SF_MAX];
     int     line[SF_MAX];
     int     n;
     double  x[SF_MAX], y[SF_MAX], w[SF_MAX], h[SF_MAX];
+    /* connectors */
+    int     e_from[SF_EDGES], e_to[SF_EDGES], e_back[SF_EDGES];
+    char   *e_label[SF_EDGES];
+    int     ne;
     double  width, height;
+    gboolean built;                /* layout already computed by the AST  */
     char   *file;
     GtkWidget *area;
     double  zoom;
     double  press_x, press_y;
 } StepFlow;
 
-static void sf_push(StepFlow *sf, int type, int depth, int line, const char *text)
-{
-    if (sf->n >= SF_MAX) return;
-    char *t = collapse_ws(text);
-    if (g_utf8_strlen(t, -1) > 72) {
-        char buf[400];
-        g_utf8_strncpy(buf, t, 72);
-        g_free(t);
-        t = g_strconcat(buf, "…", NULL);
-    }
-    sf->text[sf->n] = t;
-    sf->type[sf->n] = type;
-    sf->depth[sf->n] = depth;
-    sf->line[sf->n] = line;
-    sf->n++;
-}
+#define SF_VGAP 26.0
+#define SF_HGAP 46.0
 
 static gboolean has_assign(const char *s)
 {
@@ -2789,76 +2795,214 @@ static int classify_stmt(const char *s)
     return SF_PROCESS;
 }
 
-/* Split a function body into a linear list of flowchart steps. */
-static void parse_steps(StepFlow *sf, const char *body, int base_line)
+static char *sf_trunc(const char *text)
 {
-    int len = strlen(body), depth = 0, paren = 0, line = base_line;
-    GString *buf = g_string_new(NULL);
-    int stmt_line = base_line; gboolean started = FALSE;
-
-    sf_push(sf, SF_START, 0, base_line, "START");
-    for (int i = 0; i < len; i++) {
-        char c = body[i];
-        if (c=='/' && i+1<len && body[i+1]=='/') {
-            while (i<len && body[i]!='\n') i++;
-            line++; continue;
-        }
-        if (c=='/' && i+1<len && body[i+1]=='*') {
-            i += 2;
-            while (i+1<len && !(body[i]=='*'&&body[i+1]=='/')) { if(body[i]=='\n')line++; i++; }
-            i++; continue;
-        }
-        if (c=='"' || c=='\'') {
-            char q = c;
-            if (!started) { stmt_line = line; started = TRUE; }
-            g_string_append_c(buf, c); i++;
-            while (i<len && body[i]!=q) {
-                if (body[i]=='\\') { g_string_append_c(buf, body[i]); i++; if(i<len){g_string_append_c(buf,body[i]);i++;} continue; }
-                if (body[i]=='\n') line++;
-                g_string_append_c(buf, body[i]); i++;
-            }
-            if (i<len) g_string_append_c(buf, body[i]);
-            continue;
-        }
-        if (c=='\n') line++;
-        if (c=='(') paren++;
-        else if (c==')') { if (paren>0) paren--; }
-
-        if ((c=='{'||c=='}'||c==';') && paren==0) {
-            char *stmt = g_strstrip(g_strdup(buf->str));
-            if (*stmt) sf_push(sf, classify_stmt(stmt), depth, stmt_line, stmt);
-            g_free(stmt);
-            if (c=='{') depth++;
-            else if (c=='}' && depth>0) depth--;
-            g_string_truncate(buf, 0); started = FALSE;
-            continue;
-        }
-        if (!started && !g_ascii_isspace(c)) { stmt_line = line; started = TRUE; }
-        g_string_append_c(buf, c);
+    char *t = collapse_ws(text);
+    if (g_utf8_strlen(t, -1) > 72) {
+        char buf[400]; g_utf8_strncpy(buf, t, 72);
+        g_free(t); t = g_strconcat(buf, "…", NULL);
     }
-    char *stmt = g_strstrip(g_strdup(buf->str));
-    if (*stmt) sf_push(sf, classify_stmt(stmt), depth, stmt_line, stmt);
-    g_free(stmt);
-    g_string_free(buf, TRUE);
-    sf_push(sf, SF_END, 0, line, "END");
+    return t;
 }
 
-static void sf_layout(StepFlow *sf, cairo_t *cr)
-{
-    const double margin=30, indent=26, vgap=22;
-    double y = margin, maxw = 0;
-    for (int i = 0; i < sf->n; i++) {
-        double tw = text_width(cr, sf->text[i], 13);
-        double w = tw + 34; if (w<90) w=90; if (w>560) w=560;
-        double h = 34;
-        if (sf->type[i]==SF_DECISION||sf->type[i]==SF_LOOP) { w+=34; h=42; }
-        sf->w[i]=w; sf->h[i]=h;
-        sf->x[i]=margin + sf->depth[i]*indent;
-        sf->y[i]=y; y += h + vgap;
-        if (sf->x[i]+w > maxw) maxw = sf->x[i]+w;
+/* ---- recursive control-flow AST --------------------------------------- */
+enum { AK_SEQ, AK_STMT, AK_RETURN, AK_IF, AK_LOOP };
+typedef struct AstN {
+    int kind, stype, line;
+    char *text;
+    struct AstN **seq; int nseq;         /* AK_SEQ  */
+    struct AstN *thenb, *elseb, *body;   /* AK_IF / AK_LOOP */
+    double w, h, sx, sy, nw, nh, rx, ry; /* layout  */
+    int entry, exit_[6], nexit;
+} AstN;
+
+static AstN *ast_new(int kind){ AstN *n=g_new0(AstN,1); n->kind=kind; return n; }
+static void seq_add(AstN *s, AstN *c){
+    s->seq=g_realloc(s->seq,sizeof(AstN*)*(s->nseq+1)); s->seq[s->nseq++]=c;
+}
+static AstN *mk_simple(const char *text, int line){
+    int ty=classify_stmt(text);
+    AstN *n=ast_new(ty==SF_RETURN?AK_RETURN:AK_STMT);
+    n->text=g_strdup(text); n->line=line; n->stype=ty; return n;
+}
+static void free_ast(AstN *n){
+    if(!n)return;
+    for(int i=0;i<n->nseq;i++) free_ast(n->seq[i]);
+    g_free(n->seq); free_ast(n->thenb); free_ast(n->elseb); free_ast(n->body);
+    g_free(n->text); g_free(n);
+}
+
+typedef struct { const char *t; int pos, len, line; } P;
+static void p_skip(P *p){
+    while(p->pos<p->len){
+        char c=p->t[p->pos];
+        if(c=='\n'){p->line++;p->pos++;}
+        else if(g_ascii_isspace(c))p->pos++;
+        else if(c=='/'&&p->pos+1<p->len&&p->t[p->pos+1]=='/'){ while(p->pos<p->len&&p->t[p->pos]!='\n')p->pos++; }
+        else if(c=='/'&&p->pos+1<p->len&&p->t[p->pos+1]=='*'){ p->pos+=2; while(p->pos+1<p->len&&!(p->t[p->pos]=='*'&&p->t[p->pos+1]=='/')){if(p->t[p->pos]=='\n')p->line++;p->pos++;} p->pos+=2; }
+        else break;
     }
-    sf->width = maxw + margin;
-    sf->height = y + margin;
+}
+/* read a statement up to a top-level ; { or } (consumed); returns its text */
+static char *p_stmt(P *p, char *term, int *sline){
+    p_skip(p); *sline=p->line;
+    GString *b=g_string_new(NULL); int paren=0;
+    while(p->pos<p->len){
+        char c=p->t[p->pos];
+        if(c=='/'&&p->pos+1<p->len&&p->t[p->pos+1]=='/'){ while(p->pos<p->len&&p->t[p->pos]!='\n')p->pos++; continue; }
+        if(c=='/'&&p->pos+1<p->len&&p->t[p->pos+1]=='*'){ p->pos+=2; while(p->pos+1<p->len&&!(p->t[p->pos]=='*'&&p->t[p->pos+1]=='/')){if(p->t[p->pos]=='\n')p->line++;p->pos++;} p->pos+=2; continue; }
+        if(c=='"'||c=='\''){ char q=c; g_string_append_c(b,c); p->pos++;
+            while(p->pos<p->len&&p->t[p->pos]!=q){ if(p->t[p->pos]=='\\'){g_string_append_c(b,p->t[p->pos]);p->pos++; if(p->pos<p->len){g_string_append_c(b,p->t[p->pos]);p->pos++;} continue;} if(p->t[p->pos]=='\n')p->line++; g_string_append_c(b,p->t[p->pos]); p->pos++; }
+            if(p->pos<p->len){g_string_append_c(b,p->t[p->pos]);p->pos++;} continue; }
+        if(c=='\n')p->line++;
+        if(c=='(')paren++; else if(c==')'){if(paren>0)paren--;}
+        if(paren==0&&(c=='{'||c=='}'||c==';')){ *term=c; p->pos++; char*r=g_strstrip(g_strdup(b->str)); g_string_free(b,TRUE); return r; }
+        g_string_append_c(b,c); p->pos++;
+    }
+    *term=0; char*r=g_strstrip(g_strdup(b->str)); g_string_free(b,TRUE); return r;
+}
+static AstN *parse_seq(P *p);
+static gboolean p_peek_word(P *p, const char *w){
+    p_skip(p); int l=strlen(w);
+    if(p->pos+l>p->len) return FALSE;
+    if(strncmp(p->t+p->pos,w,l)) return FALSE;
+    char after = (p->pos+l<p->len)?p->t[p->pos+l]:0;
+    return !(g_ascii_isalnum(after)||after=='_');
+}
+static AstN *parse_if(P *p, const char *header, int line){
+    AstN *node=ast_new(AK_IF); node->text=g_strdup(header); node->line=line;
+    node->thenb=parse_seq(p);
+    int save=p->pos, sl=p->line;
+    if(p_peek_word(p,"else")){
+        p->pos+=4; p_skip(p);
+        if(p->pos<p->len && p->t[p->pos]=='{'){ p->pos++; node->elseb=parse_seq(p); }
+        else {
+            char t2; int l2; char *st2=p_stmt(p,&t2,&l2);
+            AstN *es=ast_new(AK_SEQ);
+            if(t2=='{' && classify_stmt(st2)==SF_DECISION) seq_add(es, parse_if(p,st2,l2));
+            else if(t2=='{'){ if(*st2)seq_add(es,mk_simple(st2,l2)); AstN*in=parse_seq(p); for(int k=0;k<in->nseq;k++)seq_add(es,in->seq[k]); g_free(in->seq); g_free(in); }
+            else if(*st2) seq_add(es,mk_simple(st2,l2));
+            g_free(st2); node->elseb=es;
+        }
+    } else { p->pos=save; p->line=sl; }
+    return node;
+}
+static AstN *parse_seq(P *p){
+    AstN *seq=ast_new(AK_SEQ);
+    for(;;){
+        p_skip(p); if(p->pos>=p->len) break;
+        if(p->t[p->pos]=='}'){ p->pos++; break; }
+        char term; int line; char *st=p_stmt(p,&term,&line);
+        if(term=='}'){ if(*st) seq_add(seq,mk_simple(st,line)); g_free(st); break; }
+        if(term=='{'){
+            int ty=classify_stmt(st);
+            if(ty==SF_DECISION) seq_add(seq, parse_if(p,st,line));
+            else if(ty==SF_LOOP){ AstN*n=ast_new(AK_LOOP); n->text=g_strdup(st); n->line=line; n->body=parse_seq(p); seq_add(seq,n); }
+            else { if(*st)seq_add(seq,mk_simple(st,line)); AstN*in=parse_seq(p); for(int k=0;k<in->nseq;k++)seq_add(seq,in->seq[k]); g_free(in->seq); g_free(in); }
+            g_free(st);
+        } else { if(*st) seq_add(seq,mk_simple(st,line)); g_free(st); }
+        if(seq->nseq > SF_MAX-8) break;
+    }
+    return seq;
+}
+
+static void ast_measure(AstN *n, cairo_t *cr){
+    switch(n->kind){
+      case AK_STMT: case AK_RETURN: {
+        double w=text_width(cr,n->text,13)+34; if(w<90)w=90; if(w>560)w=560;
+        n->nw=w; n->nh=34; n->w=w; n->h=34; break; }
+      case AK_SEQ: {
+        if(n->nseq==0){ n->w=12; n->h=0; break; }
+        double w=0,y=0;
+        for(int i=0;i<n->nseq;i++){ ast_measure(n->seq[i],cr); if(n->seq[i]->w>w)w=n->seq[i]->w; }
+        for(int i=0;i<n->nseq;i++){ n->seq[i]->rx=(w-n->seq[i]->w)/2; n->seq[i]->ry=y; y+=n->seq[i]->h+SF_VGAP; }
+        n->w=w; n->h=y-SF_VGAP; break; }
+      case AK_IF: {
+        double dnw=text_width(cr,n->text,13)+44; if(dnw<120)dnw=120; if(dnw>560)dnw=560;
+        n->nw=dnw; n->nh=44;
+        ast_measure(n->thenb,cr); if(n->elseb) ast_measure(n->elseb,cr);
+        double leftW=n->thenb->w, rightW=n->elseb?n->elseb->w:70;
+        double bodyW=leftW+SF_HGAP+rightW, w=MAX(dnw,bodyW), bodyX=(w-bodyW)/2;
+        n->thenb->rx=bodyX; n->thenb->ry=n->nh+SF_VGAP*2;
+        double Tentry=n->thenb->rx+n->thenb->w/2, Eentry;
+        if(n->elseb){ n->elseb->rx=bodyX+leftW+SF_HGAP; n->elseb->ry=n->nh+SF_VGAP*2; Eentry=n->elseb->rx+n->elseb->w/2; }
+        else Eentry=bodyX+leftW+SF_HGAP+rightW/2;
+        double dcx=(Tentry+Eentry)/2; n->sx=dcx-dnw/2; n->sy=0;
+        double bodyH=MAX(n->thenb->h, n->elseb?n->elseb->h:0);
+        n->w=w; n->h=n->nh+SF_VGAP*2+bodyH+SF_VGAP*2; break; }
+      case AK_LOOP: {
+        double hnw=text_width(cr,n->text,13)+50; if(hnw<120)hnw=120; if(hnw>560)hnw=560;
+        n->nw=hnw; n->nh=44; ast_measure(n->body,cr);
+        double w=MAX(hnw,n->body->w)+34;
+        n->body->rx=0; n->body->ry=n->nh+SF_VGAP*2;
+        double dcx=MAX(hnw/2, n->body->rx+n->body->w/2);
+        n->sx=dcx-hnw/2; n->sy=0;
+        n->w=w; n->h=n->nh+SF_VGAP*2+n->body->h+SF_VGAP*2; break; }
+    }
+}
+
+static int sf_mk(StepFlow *sf,int type,const char *text,int line,double x,double y,double w,double h){
+    if(sf->n>=SF_MAX) return sf->n-1;
+    int i=sf->n++;
+    sf->text[i]=text?sf_trunc(text):g_strdup("");
+    sf->type[i]=type; sf->line[i]=line; sf->x[i]=x; sf->y[i]=y; sf->w[i]=w; sf->h[i]=h;
+    return i;
+}
+static void sf_edge(StepFlow *sf,int a,int b,const char *lab,int back){
+    if(a<0||b<0||sf->ne>=SF_EDGES)return; int i=sf->ne++;
+    sf->e_from[i]=a; sf->e_to[i]=b; sf->e_label[i]=lab?g_strdup(lab):NULL; sf->e_back[i]=back;
+}
+static void ast_place(AstN *n,double ax,double ay,StepFlow *sf){
+    switch(n->kind){
+      case AK_STMT: { int i=sf_mk(sf,n->stype,n->text,n->line,ax,ay,n->nw,n->nh); n->entry=i; n->exit_[0]=i; n->nexit=1; break; }
+      case AK_RETURN: { int i=sf_mk(sf,SF_RETURN,n->text,n->line,ax,ay,n->nw,n->nh); n->entry=i; n->nexit=0; break; }
+      case AK_SEQ: {
+        if(n->nseq==0){ int i=sf_mk(sf,SF_MERGE,"",0,ax+n->w/2-5,ay,10,10); n->entry=i; n->exit_[0]=i; n->nexit=1; break; }
+        for(int k=0;k<n->nseq;k++) ast_place(n->seq[k],ax+n->seq[k]->rx,ay+n->seq[k]->ry,sf);
+        n->entry=n->seq[0]->entry;
+        for(int k=0;k+1<n->nseq;k++){ AstN*a=n->seq[k],*b=n->seq[k+1]; for(int e=0;e<a->nexit;e++) sf_edge(sf,a->exit_[e],b->entry,NULL,0); }
+        AstN*last=n->seq[n->nseq-1]; n->nexit=last->nexit;
+        for(int e=0;e<last->nexit;e++) n->exit_[e]=last->exit_[e];
+        break; }
+      case AK_IF: {
+        int d=sf_mk(sf,SF_DECISION,n->text,n->line,ax+n->sx,ay+n->sy,n->nw,n->nh); n->entry=d; n->nexit=0;
+        ast_place(n->thenb,ax+n->thenb->rx,ay+n->thenb->ry,sf);
+        sf_edge(sf,d,n->thenb->entry,"T",0);
+        for(int e=0;e<n->thenb->nexit&&n->nexit<6;e++) n->exit_[n->nexit++]=n->thenb->exit_[e];
+        if(n->elseb){ ast_place(n->elseb,ax+n->elseb->rx,ay+n->elseb->ry,sf); sf_edge(sf,d,n->elseb->entry,"F",0);
+            for(int e=0;e<n->elseb->nexit&&n->nexit<6;e++) n->exit_[n->nexit++]=n->elseb->exit_[e]; }
+        else if(n->nexit<6) n->exit_[n->nexit++]=d;   /* false path continues */
+        break; }
+      case AK_LOOP: {
+        int hidx=sf_mk(sf,SF_LOOP,n->text,n->line,ax+n->sx,ay+n->sy,n->nw,n->nh); n->entry=hidx;
+        ast_place(n->body,ax+n->body->rx,ay+n->body->ry,sf);
+        sf_edge(sf,hidx,n->body->entry,"T",0);
+        for(int e=0;e<n->body->nexit;e++) sf_edge(sf,n->body->exit_[e],hidx,NULL,1);
+        n->exit_[0]=hidx; n->nexit=1; break; }
+    }
+}
+
+static void build_detailed(StepFlow *sf, const char *body, int base_line, cairo_t *cr)
+{
+    P p={body,0,(int)strlen(body),base_line};
+    AstN *prog=parse_seq(&p);
+    ast_measure(prog,cr);
+
+    double margin=30, startH=30;
+    int startIdx=sf_mk(sf,SF_START,"START",base_line,margin,margin,90,startH);
+    double progY=margin+startH+SF_VGAP;
+    ast_place(prog, margin, progY, sf);
+    sf_edge(sf,startIdx,prog->entry,NULL,0);
+
+    double entryx=sf->x[prog->entry]+sf->w[prog->entry]/2;
+    sf->x[startIdx]=entryx-45;
+    double maxy=0; for(int i=0;i<sf->n;i++) if(sf->y[i]+sf->h[i]>maxy)maxy=sf->y[i]+sf->h[i];
+    int endIdx=sf_mk(sf,SF_END,"END",base_line,entryx-45,maxy+SF_VGAP,90,30);
+    for(int e=0;e<prog->nexit;e++) sf_edge(sf,prog->exit_[e],endIdx,NULL,0);
+
+    double W=0,H=0; for(int i=0;i<sf->n;i++){ if(sf->x[i]+sf->w[i]>W)W=sf->x[i]+sf->w[i]; if(sf->y[i]+sf->h[i]>H)H=sf->y[i]+sf->h[i]; }
+    sf->width=W+margin; sf->height=H+margin; sf->built=TRUE;
+    free_ast(prog);
 }
 
 static void sf_shape(cairo_t *cr, int type, double x, double y, double w, double h)
@@ -2891,23 +3035,45 @@ static gboolean sf_draw(GtkWidget *area, cairo_t *cr, gpointer data)
     double z = sf->zoom>0?sf->zoom:1.0; cairo_scale(cr,z,z);
     cairo_select_font_face(cr,"monospace",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_NORMAL);
     cairo_set_font_size(cr,13);
-    if (sf->width==0) sf_layout(sf,cr);
 
-    /* connectors */
+    /* connectors (from the edge list) */
     cairo_set_line_width(cr,1.5);
-    for (int i=0;i+1<sf->n;i++) {
-        double ax=sf->x[i]+sf->w[i]/2, ay=sf->y[i]+sf->h[i];
-        double bx=sf->x[i+1]+sf->w[i+1]/2, by=sf->y[i+1];
+    for (int k=0;k<sf->ne;k++) {
+        int a=sf->e_from[k], b=sf->e_to[k];
+        double acx=sf->x[a]+sf->w[a]/2, aby=sf->y[a]+sf->h[a];
+        double bcx=sf->x[b]+sf->w[b]/2, bty=sf->y[b];
         cairo_set_source_rgb(cr,0.45,0.5,0.55);
-        cairo_move_to(cr,ax,ay);
-        if (fabs(ax-bx)<1) cairo_line_to(cr,bx,by);
-        else { double my=(ay+by)/2; cairo_line_to(cr,ax,my); cairo_line_to(cr,bx,my); cairo_line_to(cr,bx,by); }
-        cairo_stroke(cr);
-        cairo_move_to(cr,bx,by); cairo_line_to(cr,bx-4,by-7);
-        cairo_move_to(cr,bx,by); cairo_line_to(cr,bx+4,by-7); cairo_stroke(cr);
+        if (sf->e_back[k]) {
+            /* loop back-edge: route along the right side up to the header */
+            double lane = sf->x[b]+sf->w[b] + 20;
+            double bry = sf->y[b]+sf->h[b]/2;
+            double afx = sf->x[a]+sf->w[a]/2, afy=sf->y[a]+sf->h[a];
+            cairo_move_to(cr,afx,afy);
+            cairo_line_to(cr,lane,afy);
+            cairo_line_to(cr,lane,bry);
+            cairo_line_to(cr,sf->x[b]+sf->w[b],bry);
+            cairo_stroke(cr);
+            double ex=sf->x[b]+sf->w[b];
+            cairo_move_to(cr,ex,bry); cairo_line_to(cr,ex+7,bry-4);
+            cairo_move_to(cr,ex,bry); cairo_line_to(cr,ex+7,bry+4); cairo_stroke(cr);
+        } else {
+            cairo_move_to(cr,acx,aby);
+            if (fabs(acx-bcx)<1) cairo_line_to(cr,bcx,bty);
+            else { double my=(aby+bty)/2; cairo_line_to(cr,acx,my); cairo_line_to(cr,bcx,my); cairo_line_to(cr,bcx,bty); }
+            cairo_stroke(cr);
+            cairo_move_to(cr,bcx,bty); cairo_line_to(cr,bcx-4,bty-7);
+            cairo_move_to(cr,bcx,bty); cairo_line_to(cr,bcx+4,bty-7); cairo_stroke(cr);
+        }
+        if (sf->e_label[k]) {
+            cairo_set_source_rgb(cr,0.3,0.3,0.35);
+            double lx = (acx+bcx)/2 + 5, ly = aby + 13;
+            cairo_move_to(cr, lx, ly);
+            cairo_show_text(cr, sf->e_label[k]);
+        }
     }
 
     for (int i=0;i<sf->n;i++) {
+        if (sf->type[i]==SF_MERGE) continue;
         int t=sf->type[i];
         double x=sf->x[i],y=sf->y[i],w=sf->w[i],h=sf->h[i];
         double fr,fg,fb_,sr,sg,sb;
@@ -2994,16 +3160,13 @@ static void sf_save(GtkButton *b,gpointer d)
     gtk_widget_destroy(dlg);
 }
 static void sf_destroy(GtkWidget *w,gpointer d)
-{ (void)w; StepFlow *sf=d; for(int i=0;i<sf->n;i++)g_free(sf->text[i]); g_free(sf->file); g_free(sf); }
+{ (void)w; StepFlow *sf=d;
+  for(int i=0;i<sf->n;i++)g_free(sf->text[i]);
+  for(int i=0;i<sf->ne;i++)g_free(sf->e_label[i]);
+  g_free(sf->file); g_free(sf); }
 
 static void show_stepflow_window(StepFlow *sf, const char *fname)
 {
-    cairo_surface_t *tmp=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,1,1);
-    cairo_t *mcr=cairo_create(tmp);
-    cairo_select_font_face(mcr,"monospace",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_NORMAL);
-    cairo_set_font_size(mcr,13); sf_layout(sf,mcr);
-    cairo_destroy(mcr); cairo_surface_destroy(tmp);
-
     double fit=MIN(1040.0/sf->width,740.0/sf->height);
     if(fit>1.0)fit=1.0; if(fit<0.2)fit=0.2; sf->zoom=fit;
 
@@ -3110,7 +3273,12 @@ static void act_detailed_flow(GtkWidget *w, gpointer d)
     StepFlow *sf=g_new0(StepFlow,1);
     sf->zoom=1.0;
     sf->file = doc->path ? g_strdup(doc->path) : NULL;
-    parse_steps(sf, body, base_line);
+    cairo_surface_t *ms=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,1,1);
+    cairo_t *mcr=cairo_create(ms);
+    cairo_select_font_face(mcr,"monospace",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_NORMAL);
+    cairo_set_font_size(mcr,13);
+    build_detailed(sf, body, base_line, mcr);
+    cairo_destroy(mcr); cairo_surface_destroy(ms);
     g_free(body); g_free(text);
     show_stepflow_window(sf, best_name);
     g_free(best_name);
@@ -3206,6 +3374,23 @@ static gboolean on_query_tooltip(GtkWidget *view, int x, int y, gboolean kbd,
     gtk_tooltip_set_text(tip, info);
     g_free(info);
     return TRUE;
+}
+
+/* Ctrl+Shift+Space pops up the auto-completion list. Once it is open, the
+   highlighted suggestion is accepted with Enter or Tab (which still work while
+   Ctrl+Shift are held). */
+static gboolean on_view_key(GtkWidget *view, GdkEventKey *ev, gpointer u)
+{
+    (void)u;
+    guint mods = ev->state & (GDK_CONTROL_MASK | GDK_SHIFT_MASK | GDK_MOD1_MASK);
+    if (mods == (GDK_CONTROL_MASK | GDK_SHIFT_MASK) &&
+        (ev->keyval == GDK_KEY_space || ev->keyval == GDK_KEY_Return ||
+         ev->keyval == GDK_KEY_KP_Enter)) {
+        if (app.autocomplete)
+            g_signal_emit_by_name(view, "show-completion");
+        return TRUE;
+    }
+    return FALSE;
 }
 
 /* ===================================================================== */
@@ -3887,12 +4072,12 @@ static int stepflow_png_export(const char *src, const char *out)
     int base_line=1; for(gssize p=0;p<brace;p++) if(text[p]=='\n')base_line++;
     char *body=g_strndup(text+brace+1,bend-(brace+1));
     StepFlow *sf=g_new0(StepFlow,1); sf->zoom=1.0;
-    parse_steps(sf, body, base_line); g_free(body); g_free(text);
-
     cairo_surface_t *m=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,1,1);
     cairo_t *mc=cairo_create(m);
     cairo_select_font_face(mc,"monospace",CAIRO_FONT_SLANT_NORMAL,CAIRO_FONT_WEIGHT_NORMAL);
-    sf_layout(sf,mc); cairo_destroy(mc); cairo_surface_destroy(m);
+    build_detailed(sf, body, base_line, mc);
+    cairo_destroy(mc); cairo_surface_destroy(m);
+    g_free(body); g_free(text);
     cairo_surface_t *s=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,(int)sf->width,(int)sf->height);
     cairo_t *cr=cairo_create(s); sf_draw(NULL,cr,sf);
     cairo_surface_write_to_png(s,out); cairo_destroy(cr); cairo_surface_destroy(s);
