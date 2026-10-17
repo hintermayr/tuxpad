@@ -2417,16 +2417,48 @@ static void on_zoom_out(GtkButton *b, gpointer d)
 static void on_zoom_reset(GtkButton *b, gpointer d)
 { (void)b; FlowGraph *g = d; g->zoom = 1.0; flow_apply_zoom(g); }
 
+/* Scroll the enclosing GtkScrolledWindow explicitly. Returning FALSE from a
+   child's scroll handler does not reliably reach the scrolled window, so we
+   move its adjustment ourselves (Shift = horizontal). */
+static gboolean scroll_enclosing(GtkWidget *area, GdkEventScroll *ev)
+{
+    GtkWidget *sw = gtk_widget_get_ancestor(area, GTK_TYPE_SCROLLED_WINDOW);
+    if (!sw) return FALSE;
+    gboolean horiz = (ev->state & GDK_SHIFT_MASK) ||
+                     ev->direction == GDK_SCROLL_LEFT ||
+                     ev->direction == GDK_SCROLL_RIGHT;
+    GtkAdjustment *adj = horiz
+        ? gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(sw))
+        : gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(sw));
+    double step = gtk_adjustment_get_step_increment(adj);
+    if (step <= 0) step = 40;
+    double d = 0;
+    if (ev->direction == GDK_SCROLL_UP || ev->direction == GDK_SCROLL_LEFT)
+        d = -step * 3;
+    else if (ev->direction == GDK_SCROLL_DOWN || ev->direction == GDK_SCROLL_RIGHT)
+        d = step * 3;
+    else if (ev->direction == GDK_SCROLL_SMOOTH) {
+        double dx, dy;
+        gdk_event_get_scroll_deltas((GdkEvent *)ev, &dx, &dy);
+        d = (horiz ? dx : dy) * step * 3;
+    }
+    double v = gtk_adjustment_get_value(adj) + d;
+    double hi = gtk_adjustment_get_upper(adj) - gtk_adjustment_get_page_size(adj);
+    double lo = gtk_adjustment_get_lower(adj);
+    v = CLAMP(v, lo, hi);
+    gtk_adjustment_set_value(adj, v);
+    return TRUE;
+}
+
 static gboolean on_flow_scroll(GtkWidget *area, GdkEventScroll *ev, gpointer d)
 {
-    (void)area;
     FlowGraph *g = d;
-    if (!(ev->state & GDK_CONTROL_MASK)) return FALSE;  /* let it scroll */
+    if (!(ev->state & GDK_CONTROL_MASK)) return scroll_enclosing(area, ev);
     if (ev->direction == GDK_SCROLL_UP)
         g->zoom = MIN(g->zoom * 1.1, 4.0);
     else if (ev->direction == GDK_SCROLL_DOWN)
         g->zoom = MAX(g->zoom / 1.1, 0.25);
-    else return FALSE;
+    else return TRUE;
     flow_apply_zoom(g);
     return TRUE;
 }
@@ -3137,10 +3169,10 @@ static void sf_zin (GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf->zoom=MIN(
 static void sf_zout(GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf->zoom=MAX(sf->zoom/1.2,0.25);sf_apply_zoom(sf);}
 static void sf_zrst(GtkButton *b,gpointer d){(void)b;StepFlow*sf=d;sf->zoom=1.0;sf_apply_zoom(sf);}
 static gboolean sf_scroll(GtkWidget *a,GdkEventScroll *ev,gpointer d)
-{ (void)a; StepFlow*sf=d; if(!(ev->state&GDK_CONTROL_MASK))return FALSE;
+{ StepFlow*sf=d; if(!(ev->state&GDK_CONTROL_MASK))return scroll_enclosing(a,ev);
   if(ev->direction==GDK_SCROLL_UP)sf->zoom=MIN(sf->zoom*1.1,4.0);
   else if(ev->direction==GDK_SCROLL_DOWN)sf->zoom=MAX(sf->zoom/1.1,0.25);
-  else return FALSE; sf_apply_zoom(sf); return TRUE; }
+  else return TRUE; sf_apply_zoom(sf); return TRUE; }
 static void sf_save(GtkButton *b,gpointer d)
 {
     (void)b; StepFlow *sf=d;
