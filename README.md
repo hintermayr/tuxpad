@@ -31,8 +31,9 @@ GtkSourceView.
     - **Automatic structured layout** — functions are placed in columns by
       call depth and ordered to reduce crossing arrows
     - **Zoom in/out** with the toolbar buttons or Ctrl+scroll
-    - **Drag** a box to rearrange it; **click** a box to jump to that function
-      in the editor
+    - **Drag** a box to rearrange it; **click** a box to open its function in
+      the editor — the editor window is raised and the cursor jumps to the
+      function's definition (hovering a box shows a hand cursor)
     - **Flow Diagram (Directory)** (Shift+F8) builds a combined call graph of
       every C/C++ file in the folder of the currently open file (cross-file
       calls included; open files use their live, unsaved contents)
@@ -58,6 +59,7 @@ GtkSourceView.
 | Save All      | Ctrl+Alt+S          | Find in Files  | Ctrl+Shift+F  |
 | Format Doc    | Ctrl+Shift+I        | Go to Line     | Ctrl+G        |
 | Syntax Check  | F7                  | Flow Diagram   | F8            |
+| Flow (Dir.)   | Shift+F8            | Help           | F1            |
 | Close tab     | Ctrl+W              | Zoom In        | Ctrl++        |
 | Print         | Ctrl+P              | Zoom Out       | Ctrl+-        |
 | Undo / Redo   | Ctrl+Z / Ctrl+Y     | Reset Zoom     | Ctrl+0        |

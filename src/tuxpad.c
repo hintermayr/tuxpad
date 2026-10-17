@@ -2286,7 +2286,21 @@ static gboolean on_flow_press(GtkWidget *area, GdkEventButton *ev, gpointer data
 static gboolean on_flow_motion(GtkWidget *area, GdkEventMotion *ev, gpointer data)
 {
     FlowGraph *g = data;
-    if (g->drag_idx < 0 || !(ev->state & GDK_BUTTON1_MASK)) return FALSE;
+
+    /* while not dragging, show a hand cursor over clickable nodes */
+    if (!(ev->state & GDK_BUTTON1_MASK)) {
+        GdkWindow *gw = gtk_widget_get_window(area);
+        if (gw) {
+            int over = flow_hit(g, ev->x / g->zoom, ev->y / g->zoom);
+            GdkCursor *c = over >= 0
+                ? gdk_cursor_new_from_name(gtk_widget_get_display(area), "pointer")
+                : NULL;
+            gdk_window_set_cursor(gw, c);
+            if (c) g_object_unref(c);
+        }
+        return FALSE;
+    }
+    if (g->drag_idx < 0) return FALSE;
     if (fabs(ev->x - g->press_x) > 3 || fabs(ev->y - g->press_y) > 3)
         g->moved = TRUE;
     if (g->moved) {
@@ -2315,6 +2329,8 @@ static gboolean on_flow_release(GtkWidget *area, GdkEventButton *ev, gpointer da
         int i = g->drag_idx;
         if (g->file[i]) open_at_line(g->file[i], g->def_line[i]);
         else            goto_line_current(g->def_line[i]);
+        /* raise the editor window so the jump is visible */
+        gtk_window_present(GTK_WINDOW(app.window));
     }
     g->drag_idx = -1;
     g->moved = FALSE;
