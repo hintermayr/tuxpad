@@ -179,3 +179,14 @@ strip those variables:
 ```sh
 env -u GTK_PATH -u GDK_PIXBUF_MODULE_FILE ./tuxpad
 ```
+
+## Help
+
+Press **F1** in tuxpad (Help → Help Contents) for the complete in-app
+description of every menu, tool and shortcut.
+
+## Author
+
+Martin Hintermayr <mammutandroid@gmail.com>
+
+Licensed under the MIT License — see [LICENSE](LICENSE).

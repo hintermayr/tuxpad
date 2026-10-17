@@ -13,6 +13,7 @@
  *   - Notepad++-style status bar (length/lines, Ln/Col/Sel, EOL, encoding)
  *   - Drag & drop files to open, full keyboard shortcuts
  *
+ * Author:  Martin Hintermayr <mammutandroid@gmail.com>
  * License: MIT
  */
 
@@ -2603,6 +2604,122 @@ static GtkWidget *build_theme_menu(void)
     return menu;
 }
 
+/* The complete in-app documentation, shown by Help > Help Contents (F1). */
+static const char *HELP_MARKUP =
+"<big><b>tuxpad — Help</b></big>\n"
+"A Notepad++-style source code editor for Linux, built with GTK+ 3 and "
+"GtkSourceView.\n\n"
+
+"<b>Overview</b>\n"
+"tuxpad edits several documents in reorderable tabs. A <tt>*</tt> on a tab "
+"marks unsaved changes. The status bar shows the text length and line count, "
+"the cursor position (Ln/Col), the selection length, the end-of-line style, "
+"the encoding, and the detected language.\n\n"
+
+"<b>File</b>\n"
+"New (Ctrl+N), Open (Ctrl+O), Save (Ctrl+S), Save As (Ctrl+Shift+S), "
+"Save All (Ctrl+Alt+S), Close tab (Ctrl+W), Close All, Print (Ctrl+P), "
+"Exit (Ctrl+Q). You can also drag &amp; drop files onto the window, or pass "
+"them on the command line.\n\n"
+
+"<b>Edit</b>\n"
+"Undo (Ctrl+Z), Redo (Ctrl+Y), Cut (Ctrl+X), Copy (Ctrl+C), Paste (Ctrl+V), "
+"Delete, Select All (Ctrl+A).\n\n"
+
+"<b>Search</b>\n"
+"• <b>Find</b> (Ctrl+F) and <b>Replace</b> (Ctrl+H) with options: match case, "
+"whole word, regular expression, and wrap around.\n"
+"• <b>Find Next</b> (F3) / <b>Find Previous</b> (Shift+F3).\n"
+"• <b>Find in Files</b> (Ctrl+Shift+F): search a directory (optionally its "
+"subdirectories) using the same options and a file filter such as "
+"<tt>*.c *.h</tt>. Matches appear in the panel at the bottom; double-click a "
+"hit to jump to it.\n"
+"• <b>Go to Line</b> (Ctrl+G).\n\n"
+
+"<b>View</b>\n"
+"Word wrap, show/hide line numbers, zoom in (Ctrl++), zoom out (Ctrl+-), "
+"reset zoom (Ctrl+0), and a choice of color themes.\n\n"
+
+"<b>Tools</b>\n"
+"• <b>Format Document</b> (Ctrl+Shift+I): reformats the file using "
+"<tt>clang-format</tt>, <tt>astyle</tt>, or <tt>indent</tt> if one is "
+"installed.\n"
+"• <b>Syntax Check</b> (F7): compiles the current C/C++ buffer with "
+"<tt>gcc</tt>/<tt>g++ -fsyntax-only</tt> and lists errors and warnings in the "
+"bottom panel; double-click a message to jump to the line.\n"
+"• <b>Flow Diagram</b> (F8): draws the call graph of the C/C++ functions. Each "
+"box shows the function's signature (return type, name, parameters) and, below "
+"it, the parameters, detected local variables, and return values; arrows show "
+"which function calls which. The layout is arranged automatically. In the "
+"diagram window you can:\n"
+"    – <b>drag</b> a box to move it,\n"
+"    – <b>click</b> a box to jump to that function in the editor,\n"
+"    – <b>zoom</b> with the toolbar buttons or Ctrl+scroll,\n"
+"    – <b>Save as PNG</b>.\n"
+"• <b>Flow Diagram (Directory)</b> (Shift+F8): the same, but combining every "
+"C/C++ file in a chosen directory (cross-file calls included).\n\n"
+
+"<b>Language</b>\n"
+"The language is detected automatically from the file name or its content; you "
+"can also set it manually from the Language menu.\n\n"
+
+"<b>Plugins</b>\n"
+"Plugins add commands to the Plugins menu. They are shared objects loaded at "
+"startup from <tt>plugins/</tt> next to the binary, "
+"<tt>&lt;prefix&gt;/lib/tuxpad/plugins/</tt>, and "
+"<tt>~/.config/tuxpad/plugins/</tt>. The bundled <i>sample_tools</i> plugin "
+"adds UPPERCASE/lowercase conversion, Insert Date &amp; Time, and Word Count.\n\n"
+
+"<b>Command line</b>\n"
+"<tt>tuxpad [files…]</tt> opens files (a non-existent path starts a new named "
+"tab). <tt>tuxpad --flow-png &lt;source&gt; &lt;out.png&gt;</tt> writes a flow "
+"diagram to a PNG without opening a window.\n\n"
+
+"<b>Keyboard shortcuts</b>\n"
+"<tt>"
+"Ctrl+N New        Ctrl+F Find         F3     Find Next\n"
+"Ctrl+O Open       Ctrl+H Replace      F7     Syntax Check\n"
+"Ctrl+S Save       Ctrl+Shift+F Find in Files  F8  Flow Diagram\n"
+"Ctrl+W Close      Ctrl+G Go to Line   Shift+F8 Flow (Directory)\n"
+"Ctrl+P Print      Ctrl+Shift+I Format  Ctrl++ / Ctrl+- Zoom\n"
+"Ctrl+Z Undo       Ctrl+Y Redo         Ctrl+0  Reset Zoom\n"
+"Ctrl+A Select All Ctrl+Q Exit         F1      This help\n"
+"</tt>\n\n"
+
+"<b>Author</b>\n"
+"Martin Hintermayr &lt;mammutandroid@gmail.com&gt;\n"
+"<tt>https://github.com/hintermayr/tuxpad</tt> — MIT License\n";
+
+static void act_help(GtkWidget *w, gpointer d)
+{
+    (void)w;(void)d;
+    static GtkWidget *win = NULL;
+    if (win) { gtk_window_present(GTK_WINDOW(win)); return; }
+
+    win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(win), "tuxpad — Help");
+    gtk_window_set_transient_for(GTK_WINDOW(win), GTK_WINDOW(app.window));
+    gtk_window_set_default_size(GTK_WINDOW(win), 720, 640);
+    g_signal_connect(win, "destroy", G_CALLBACK(gtk_widget_destroyed), &win);
+
+    GtkWidget *sw = gtk_scrolled_window_new(NULL, NULL);
+    gtk_container_add(GTK_CONTAINER(win), sw);
+
+    GtkWidget *label = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(label), HELP_MARKUP);
+    gtk_label_set_xalign(GTK_LABEL(label), 0.0);
+    gtk_label_set_yalign(GTK_LABEL(label), 0.0);
+    gtk_label_set_line_wrap(GTK_LABEL(label), TRUE);
+    gtk_label_set_selectable(GTK_LABEL(label), TRUE);
+    gtk_widget_set_margin_start(label, 16);
+    gtk_widget_set_margin_end(label, 16);
+    gtk_widget_set_margin_top(label, 12);
+    gtk_widget_set_margin_bottom(label, 12);
+
+    gtk_container_add(GTK_CONTAINER(sw), label);
+    gtk_widget_show_all(win);
+}
+
 static void act_about(GtkWidget *w, gpointer d)
 {
     (void)w;(void)d;
@@ -2612,6 +2729,12 @@ static void act_about(GtkWidget *w, gpointer d)
     gtk_about_dialog_set_comments(GTK_ABOUT_DIALOG(a),
         "A Notepad++-style source code editor for Linux.\n"
         "Built with GTK+ 3 and GtkSourceView.");
+    const char *authors[] = { "Martin Hintermayr <mammutandroid@gmail.com>", NULL };
+    gtk_about_dialog_set_authors(GTK_ABOUT_DIALOG(a), authors);
+    gtk_about_dialog_set_copyright(GTK_ABOUT_DIALOG(a),
+        "Copyright © 2026 Martin Hintermayr");
+    gtk_about_dialog_set_website(GTK_ABOUT_DIALOG(a),
+        "https://github.com/hintermayr/tuxpad");
     gtk_about_dialog_set_license_type(GTK_ABOUT_DIALOG(a), GTK_LICENSE_MIT_X11);
     gtk_window_set_transient_for(GTK_WINDOW(a), GTK_WINDOW(app.window));
     gtk_dialog_run(GTK_DIALOG(a));
@@ -2731,6 +2854,8 @@ static GtkWidget *build_menubar(void)
 
     /* Help */
     m = add_submenu(bar, "_Help");
+    add_item(m, "_Help Contents", G_CALLBACK(act_help), GDK_KEY_F1, 0);
+    add_sep(m);
     add_item(m, "_About",        G_CALLBACK(act_about), 0, 0);
 
     return bar;
